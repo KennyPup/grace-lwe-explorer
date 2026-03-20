@@ -1,0 +1,12 @@
+node_modules
+dist
+.DS_Store
+server/public
+vite.config.ts.*
+*.tar.gz
+*.db
+*.db-shm
+*.db-wal
+# Large binary data — downloaded/generated at runtime on Render
+data/grace_mascon.nc
+data/grace_lwe.bin

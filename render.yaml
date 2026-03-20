@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: grace-lwe-explorer
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: EARTHDATA_USER
+        value: kchgeo
+      - key: EARTHDATA_PASS
+        value: 1ShabelleHydro!
+    disk:
+      name: grace-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 2

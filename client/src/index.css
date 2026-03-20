@@ -1,0 +1,192 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ─────────────────────────────────────────────
+   GRACE LWE Explorer — Dark Geoscientific Theme
+   Deep navy/slate surfaces, cyan accent
+   ───────────────────────────────────────────── */
+
+:root {
+  --font-body: 'Inter', 'Helvetica Neue', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  /* Dark mode primary (always dark) */
+  --background: 220 20% 8%;
+  --foreground: 210 15% 88%;
+
+  --card: 220 18% 11%;
+  --card-foreground: 210 15% 88%;
+
+  --popover: 220 18% 11%;
+  --popover-foreground: 210 15% 88%;
+
+  --primary: 186 72% 47%;       /* Cyan */
+  --primary-foreground: 220 20% 8%;
+
+  --secondary: 220 15% 18%;
+  --secondary-foreground: 210 12% 70%;
+
+  --muted: 220 15% 16%;
+  --muted-foreground: 210 10% 52%;
+
+  --accent: 186 72% 47%;
+  --accent-foreground: 220 20% 8%;
+
+  --destructive: 0 62% 50%;
+  --destructive-foreground: 210 15% 88%;
+
+  --border: 220 15% 20%;
+  --input: 220 15% 18%;
+  --ring: 186 72% 47%;
+
+  --radius: 0.5rem;
+
+  /* Custom tokens */
+  --color-bg: hsl(220, 20%, 8%);
+  --color-surface: hsl(220, 18%, 11%);
+  --color-surface-2: hsl(220, 16%, 14%);
+  --color-border: hsl(220, 15%, 20%);
+  --color-text: hsl(210, 15%, 88%);
+  --color-text-muted: hsl(210, 10%, 52%);
+  --color-cyan: hsl(186, 72%, 47%);
+  --color-cyan-dim: hsl(186, 50%, 30%);
+  --color-gold: hsl(42, 85%, 55%);
+  --color-red: hsl(0, 72%, 55%);
+  --color-green: hsl(142, 60%, 45%);
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.4);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.5);
+  --shadow-lg: 0 12px 40px rgba(0,0,0,0.6);
+}
+
+/* Apply dark mode always */
+html { color-scheme: dark; }
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  scroll-behavior: smooth;
+}
+
+body {
+  height: 100%;
+  width: 100%;
+  line-height: 1.6;
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--color-text);
+  background-color: var(--color-bg);
+  overflow: hidden;
+}
+
+#root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* ── Leaflet overrides ── */
+.leaflet-container {
+  background: #0a0e1a !important;
+  font-family: var(--font-body) !important;
+}
+
+.leaflet-control-attribution {
+  background: rgba(10, 14, 26, 0.85) !important;
+  color: hsl(210, 10%, 45%) !important;
+  font-size: 10px !important;
+}
+
+.leaflet-control-attribution a { color: var(--color-cyan) !important; }
+
+.leaflet-draw-toolbar a,
+.leaflet-bar a {
+  background-color: hsl(220, 18%, 13%) !important;
+  color: var(--color-text) !important;
+  border-color: var(--color-border) !important;
+}
+
+.leaflet-draw-toolbar a:hover,
+.leaflet-bar a:hover {
+  background-color: hsl(220, 18%, 18%) !important;
+  color: var(--color-cyan) !important;
+}
+
+.leaflet-draw-section .leaflet-draw-toolbar {
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+/* Draw rectangle style */
+.leaflet-interactive {
+  stroke: hsl(186, 72%, 47%);
+}
+
+/* ── Leaflet draw toolbar — ensure it appears above map tiles ── */
+.leaflet-draw.leaflet-control { z-index: 1000 !important; }
+.leaflet-draw-toolbar a {
+  background-color: hsl(220, 18%, 14%) !important;
+  color: var(--color-text) !important;
+  border-color: hsl(220, 15%, 26%) !important;
+  line-height: 26px !important;
+}
+.leaflet-draw-toolbar a:hover {
+  background-color: hsl(220, 18%, 20%) !important;
+  color: var(--color-cyan) !important;
+}
+/* Highlight rectangle button with cyan tint */
+.leaflet-draw-draw-rectangle {
+  border-left: 2px solid var(--color-cyan) !important;
+}
+.leaflet-draw-toolbar .leaflet-draw-draw-rectangle::after {
+  content: ' □ Draw';
+  font-size: 11px;
+  padding-left: 4px;
+  color: var(--color-cyan);
+}
+
+/* ── Scrollbars ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--color-surface); }
+::-webkit-scrollbar-thumb { background: hsl(220, 15%, 28%); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(220, 15%, 38%); }
+
+/* ── Mono values ── */
+.mono { font-family: var(--font-mono); }
+
+/* ── Gradient text ── */
+.gradient-text {
+  background: linear-gradient(135deg, var(--color-cyan), hsl(210, 80%, 65%));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── Status dot ── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+
+/* ── Loading bar ── */
+@keyframes loading-bar {
+  0% { width: 0%; }
+  100% { width: 100%; }
+}
+
+/* ── Chart tooltip ── */
+.recharts-tooltip-wrapper { z-index: 1000 !important; }
+.custom-tooltip {
+  background: hsl(220, 20%, 12%) !important;
+  border: 1px solid var(--color-border) !important;
+  border-radius: 6px !important;
+  padding: 8px 12px !important;
+  box-shadow: var(--shadow-md) !important;
+  font-size: 12px;
+}
