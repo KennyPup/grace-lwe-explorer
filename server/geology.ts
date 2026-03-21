@@ -67,7 +67,7 @@ Cover: dominant rock types and geologic age, major structural features if releva
 
   console.log(`[Geology] Querying LLM for ${locDesc}`);
   const message = await client.messages.create({
-    model: "claude_haiku_4_5",
+    model: "claude-haiku-4-5",
     max_tokens: 300,
     messages: [{ role: "user", content: prompt }],
   });
