@@ -993,63 +993,6 @@ export default function GraceExplorer() {
             </span>
           </div>
 
-          {/* RIVERS / DRAINAGE TOGGLE */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
-            <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
-              <path d="M1 4 Q3 2 5 4 Q7 6 9 4 Q11 2 13 4" stroke="#38bdf8" strokeWidth="1.3" fill="none" strokeLinecap="round"/>
-              <path d="M1 8 Q3 6 5 8 Q7 10 9 8 Q11 6 13 8" stroke="#38bdf8" strokeWidth="1.1" fill="none" strokeLinecap="round" strokeOpacity="0.7"/>
-              <path d="M4 11 Q5.5 9.5 7 11" stroke="#38bdf8" strokeWidth="0.9" fill="none" strokeLinecap="round" strokeOpacity="0.5"/>
-            </svg>
-            <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>Rivers</span>
-            <button
-              onClick={() => setRiversOn(v => !v)}
-              title={riversOn ? "Hide HydroRIVERS drainage" : "Show HydroRIVERS detailed drainage"}
-              style={{
-                width: 36, height: 18, borderRadius: 9, border: "none", cursor: "pointer", position: "relative",
-                background: riversOn ? "#0ea5e9" : "#30363d",
-                transition: "background 0.2s", flexShrink: 0,
-              }}
-            >
-              <span style={{
-                position: "absolute", top: 2, left: riversOn ? 18 : 2,
-                width: 14, height: 14, borderRadius: "50%", background: "#fff",
-                transition: "left 0.2s", display: "block",
-              }}/>
-            </button>
-            <span style={{ fontSize: "10px", color: riversOn ? "#38bdf8" : "#484f58", fontFamily: "monospace", width: 20 }}>
-              {riversOn ? "on" : "off"}
-            </span>
-          </div>
-
-          {/* WATERSHED LEVEL TOGGLES */}
-          <div style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
-            <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
-              <path d="M1 13 L4 8 L7 11 L10 5 L13 2" stroke="#f97316" strokeWidth="1.3" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
-              <path d="M1 13 L4 8 L7 11 L10 5 L13 2 L13 13 Z" fill="#f97316" fillOpacity="0.15"/>
-            </svg>
-            <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>Watersheds</span>
-            {([
-              { label: "L5", on: wsL5On, toggle: () => setWsL5On(v => !v), color: "#f97316", title: "Level 5 — coarse basins (~300 globally)" },
-              { label: "L6", on: wsL6On, toggle: () => setWsL6On(v => !v), color: "#facc15", title: "Level 6 — medium sub-basins (~1,300 globally)" },
-              { label: "L7", on: wsL7On, toggle: () => setWsL7On(v => !v), color: "#a3e635", title: "Level 7 — fine sub-basins (~4,700 globally)" },
-            ]).map(({ label, on, toggle, color, title }) => (
-              <button
-                key={label}
-                onClick={toggle}
-                title={title}
-                style={{
-                  padding: "2px 7px", fontSize: "10px", fontWeight: on ? 700 : 400,
-                  borderRadius: 4, border: `1px solid ${on ? color : "#30363d"}`,
-                  background: on ? `${color}22` : "#0d1117",
-                  color: on ? color : "#6e7681",
-                  cursor: "pointer", transition: "all 0.15s",
-                }}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-
           {/* Divider */}
           <div style={{ width: 1, height: 30, background: "#30363d", flexShrink: 0 }}/>
 
@@ -1284,6 +1227,81 @@ export default function GraceExplorer() {
         {/* ── MAP ── */}
         <div style={{ position: "absolute", top: HDR_H, left: TC_PANEL_W, width: mapW, height: bodyH, overflow: "hidden" }}>
           <div ref={mapRef} style={{ width: "100%", height: "100%" }} data-testid="map-container"/>
+
+          {/* ── FLOATING HYDROLOGY PANEL (bottom-left of map) ── */}
+          <div style={{
+            position: "absolute", bottom: 28, left: 10, zIndex: 500,
+            background: "rgba(22,27,34,0.93)", border: "1px solid #30363d",
+            borderRadius: 8, padding: "8px 10px", minWidth: 148,
+            boxShadow: "0 2px 12px rgba(0,0,0,0.5)",
+            backdropFilter: "blur(4px)",
+          }}>
+            {/* Section label */}
+            <div style={{ fontSize: "9px", color: "#484f58", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 700, marginBottom: 6 }}>Hydrology</div>
+
+            {/* Rivers row */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <svg viewBox="0 0 12 12" width="11" height="11" fill="none">
+                  <path d="M1 3 Q3 1 5 3 Q7 5 9 3 Q11 1 12 3" stroke="#38bdf8" strokeWidth="1.2" fill="none" strokeLinecap="round"/>
+                  <path d="M1 7 Q3 5 5 7 Q7 9 9 7 Q11 5 12 7" stroke="#38bdf8" strokeWidth="1.0" fill="none" strokeLinecap="round" strokeOpacity="0.65"/>
+                </svg>
+                <span style={{ fontSize: "10px", color: "#c9d1d9", fontWeight: 500 }}>Rivers</span>
+              </div>
+              <button
+                onClick={() => setRiversOn(v => !v)}
+                title={riversOn ? "Hide HydroRIVERS drainage" : "Show HydroRIVERS detailed drainage"}
+                style={{
+                  width: 32, height: 16, borderRadius: 8, border: "none", cursor: "pointer",
+                  position: "relative", background: riversOn ? "#0ea5e9" : "#30363d",
+                  transition: "background 0.2s", flexShrink: 0,
+                }}
+              >
+                <span style={{
+                  position: "absolute", top: 2, left: riversOn ? 16 : 2,
+                  width: 12, height: 12, borderRadius: "50%", background: "#fff",
+                  transition: "left 0.2s", display: "block",
+                }}/>
+              </button>
+            </div>
+
+            {/* Divider */}
+            <div style={{ borderTop: "1px solid #21262d", marginBottom: 6 }}/>
+
+            {/* Watershed label */}
+            <div style={{ fontSize: "9px", color: "#484f58", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 700, marginBottom: 5 }}>Watersheds</div>
+
+            {/* Watershed level buttons — stacked rows of 3 */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {/* Row: description labels */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 3 }}>
+                {([
+                  { label: "L3", on: wsL5On, toggle: () => setWsL5On(v => !v), color: "#f97316", title: "Pfafstetter Level 3 — large basins (~300 globally)" },
+                  { label: "L4", on: wsL6On, toggle: () => setWsL6On(v => !v), color: "#facc15", title: "Pfafstetter Level 4 — medium basins (~1,300 globally)" },
+                  { label: "L5", on: wsL7On, toggle: () => setWsL7On(v => !v), color: "#a3e635", title: "Pfafstetter Level 5 — fine sub-basins (~4,700 globally)" },
+                ]).map(({ label, on, toggle, color, title }) => (
+                  <button
+                    key={label}
+                    onClick={toggle}
+                    title={title}
+                    style={{
+                      padding: "3px 0", fontSize: "10px", fontWeight: on ? 700 : 400,
+                      borderRadius: 4, border: `1px solid ${on ? color : "#30363d"}`,
+                      background: on ? `${color}22` : "transparent",
+                      color: on ? color : "#6e7681",
+                      cursor: "pointer", transition: "all 0.15s", textAlign: "center",
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {/* Size hint */}
+              <div style={{ fontSize: "9px", color: "#484f58", lineHeight: 1.4, textAlign: "center" }}>
+                L3 = large · L4 = medium · L5 = fine
+              </div>
+            </div>
+          </div>
 
           {!isReady && !isError && (
             <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(13,17,23,0.78)", zIndex: 2000 }}>
