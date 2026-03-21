@@ -11,6 +11,6 @@ services:
       - key: EARTHDATA_USER
         value: kchgeo
       - key: EARTHDATA_PASS
-        value: 1ShabelleHydro!
+        value: 1MoyaleHydro!
       - key: ANTHROPIC_API_KEY
         sync: false   # set this manually in Render dashboard as a secret

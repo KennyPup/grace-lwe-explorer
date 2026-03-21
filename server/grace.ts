@@ -12,7 +12,7 @@ const GRACE_URL =
 
 // NASA Earthdata credentials — update if account requires password reset
 const EARTHDATA_USER = process.env.EARTHDATA_USER || "kchgeo";
-const EARTHDATA_PASS = process.env.EARTHDATA_PASS || "1ShabelleHydro!";
+const EARTHDATA_PASS = process.env.EARTHDATA_PASS || "1MoyaleHydro!";
 
 // In-memory parsed data
 let lats: number[] = [];
@@ -26,39 +26,42 @@ let loaded = false;
 let loadError: string | null = null;
 let loadProgress = "idle";
 
+async function getEarthdataToken(user: string, pass: string): Promise<string> {
+  const { execSync } = require("child_process");
+  console.log("[GRACE] Fetching Earthdata bearer token...");
+  const result = execSync(
+    `curl -s -X POST https://urs.earthdata.nasa.gov/api/users/token --user "${user}:${pass}"`,
+    { encoding: "utf8" }
+  );
+  const json = JSON.parse(result);
+  if (!json.access_token) throw new Error(`Token fetch failed: ${result}`);
+  console.log("[GRACE] Got bearer token, expires:", json.expiration_date);
+  return json.access_token;
+}
+
 function downloadWithCurl(
   url: string,
-  user: string,
-  pass: string,
+  token: string,
   destPath: string
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const { spawn } = require("child_process");
-    // curl handles NASA Earthdata's multi-step redirect/cookie auth natively
     const args = [
-      "--location",           // follow all redirects
-      "--cookie-jar", "/tmp/nasa_cookies.txt",
-      "--cookie", "/tmp/nasa_cookies.txt",
-      "--user", `${user}:${pass}`,
+      "--location",
+      "-H", `Authorization: Bearer ${token}`,
       "--output", destPath,
-      "--progress-bar",
-      "--max-time", "600",    // 10 min timeout
+      "--max-time", "600",
       "--retry", "3",
       url
     ];
-    console.log("[GRACE] Starting curl download...");
+    console.log("[GRACE] Starting curl download with bearer token...");
     const proc = spawn("curl", args);
-    proc.stdout.on("data", (d: Buffer) => {
-      const line = d.toString().trim();
-      if (line) { loadProgress = `downloading: ${line}`; console.log("[curl]", line); }
-    });
     proc.stderr.on("data", (d: Buffer) => {
       const line = d.toString().trim();
       if (line) { loadProgress = `downloading...`; }
     });
     proc.on("close", (code: number) => {
       if (code === 0) {
-        // Verify file is a real netCDF (not an HTML error page)
         const stats = fs.existsSync(destPath) ? fs.statSync(destPath) : null;
         if (!stats || stats.size < 1000000) {
           const content = fs.existsSync(destPath) ? fs.readFileSync(destPath, "utf8").slice(0, 200) : "missing";
@@ -97,7 +100,8 @@ export async function loadGraceData(): Promise<void> {
     loadProgress = "downloading GRACE data from NASA Earthdata...";
     console.log("[GRACE] Downloading GRACE netCDF via curl...");
     try {
-      await downloadWithCurl(GRACE_URL, EARTHDATA_USER, EARTHDATA_PASS, NC_FILE);
+      const token = await getEarthdataToken(EARTHDATA_USER, EARTHDATA_PASS);
+      await downloadWithCurl(GRACE_URL, token, NC_FILE);
     } catch (err: any) {
       loadError = `Download failed: ${err.message}`;
       loadProgress = "error";
