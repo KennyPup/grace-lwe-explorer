@@ -28,9 +28,22 @@ let loadProgress = "idle";
 
 async function getEarthdataToken(user: string, pass: string): Promise<string> {
   const { execSync } = require("child_process");
-  console.log("[GRACE] Fetching Earthdata bearer token...");
+  const auth = `--user "${user}:${pass}"`;
+  // First try to reuse an existing token (NASA allows max 2)
+  console.log("[GRACE] Checking for existing Earthdata tokens...");
+  const listResult = execSync(
+    `curl -s https://urs.earthdata.nasa.gov/api/users/tokens ${auth}`,
+    { encoding: "utf8" }
+  );
+  const existing = JSON.parse(listResult);
+  if (Array.isArray(existing) && existing.length > 0 && existing[0].access_token) {
+    console.log("[GRACE] Reusing existing bearer token, expires:", existing[0].expiration_date);
+    return existing[0].access_token;
+  }
+  // No existing token — create one
+  console.log("[GRACE] Creating new Earthdata bearer token...");
   const result = execSync(
-    `curl -s -X POST https://urs.earthdata.nasa.gov/api/users/token --user "${user}:${pass}"`,
+    `curl -s -X POST https://urs.earthdata.nasa.gov/api/users/token ${auth}`,
     { encoding: "utf8" }
   );
   const json = JSON.parse(result);
