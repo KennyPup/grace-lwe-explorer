@@ -1,9 +1,9 @@
 services:
   - type: web
-    name: grace-lwe-explorer
+    name: grace-tc-geology-explorer
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
+    buildCommand: pip3 install netCDF4 numpy && npm install && npm run build
     startCommand: npm start
     envVars:
       - key: NODE_ENV
@@ -12,7 +12,5 @@ services:
         value: kchgeo
       - key: EARTHDATA_PASS
         value: 1ShabelleHydro!
-    disk:
-      name: grace-data
-      mountPath: /opt/render/project/src/data
-      sizeGB: 2
+      - key: ANTHROPIC_API_KEY
+        sync: false   # set this manually in Render dashboard as a secret

@@ -10,3 +10,7 @@ vite.config.ts.*
 # Large binary data — downloaded/generated at runtime on Render
 data/grace_mascon.nc
 data/grace_lwe.bin
+# Runtime caches
+data/geology_cache/
+data/terraclimate_cache/
+__pycache__/

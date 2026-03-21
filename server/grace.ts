@@ -253,9 +253,18 @@ export function queryBBox(minLat: number, maxLat: number, minLon: number, maxLon
     return { date: daysToDate(t), lwe: count > 0 ? parseFloat((sum / count).toFixed(3)) : null };
   });
 
+  // Build grid cell centres (convert lons back to -180..180)
+  const cells: { lat: number; lon: number }[] = [];
+  for (const li of latIdxs) {
+    for (const loi of lonIdxs) {
+      cells.push({ lat: lats[li], lon: lons[loi] > 180 ? lons[loi] - 360 : lons[loi] });
+    }
+  }
+
   return {
     bbox: { minLat, maxLat, minLon, maxLon },
-    nGridCells: latIdxs.length * lonIdxs.length,
+    nGridCells: cells.length,
+    cells,
     monthly,
     annual: buildAnnual(monthly),
   };
