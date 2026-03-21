@@ -204,6 +204,23 @@ export default function GraceExplorer() {
     }
   }, []);
 
+  // Convert raw fetch/HTTP errors into user-friendly messages
+  function friendlyError(e: any): string {
+    const msg: string = String(e?.message ?? e ?? "");
+    // apiRequest throws "502: <!DOCTYPE..." or "503: ..." before returning
+    const codeMatch = msg.match(/^(\d{3})/);
+    const status = codeMatch ? parseInt(codeMatch[1], 10) : 0;
+    if (status === 502 || status === 503)
+      return "Server is waking up — please wait ~30 seconds and click again.";
+    if (status === 504)
+      return "Request timed out — server may be starting, please try again.";
+    if (status === 500)
+      return "Server error — please try again.";
+    if (msg.includes("Failed to fetch") || msg.includes("NetworkError"))
+      return "Network error — check your connection and try again.";
+    return msg;
+  }
+
   const runQuery = useCallback(async (q: { type: "point" | "bbox"; params: Record<string, number> }) => {
     setQueryLoading(true);
     setQueryError(null);
@@ -218,7 +235,7 @@ export default function GraceExplorer() {
       const orig = q.type === "point" ? { lat: q.params.lat, lon: q.params.lon } : undefined;
       drawTiles(data, orig);
     } catch (e: any) {
-      setQueryError(e.message);
+      setQueryError(friendlyError(e));
     } finally {
       setQueryLoading(false);
     }
@@ -236,7 +253,7 @@ export default function GraceExplorer() {
       if (data.error) throw new Error(data.error);
       setTcResult(data);
     } catch (e: any) {
-      setTcError(e.message);
+      setTcError(friendlyError(e));
     } finally {
       setTcLoading(false);
     }
@@ -267,7 +284,7 @@ export default function GraceExplorer() {
       if (data.error) throw new Error(data.error);
       setGeoSummary(data.summary);
     } catch (e: any) {
-      setGeoError(e.message);
+      setGeoError(friendlyError(e));
     } finally {
       setGeoLoading(false);
     }
