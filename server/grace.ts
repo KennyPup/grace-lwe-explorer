@@ -1,7 +1,5 @@
 import fs from "fs";
 import path from "path";
-import https from "https";
-import http from "http";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 const NC_FILE = path.join(DATA_DIR, "grace_mascon.nc");
@@ -28,55 +26,52 @@ let loaded = false;
 let loadError: string | null = null;
 let loadProgress = "idle";
 
-function downloadWithRedirects(
+function downloadWithCurl(
   url: string,
-  authHeader: string,
-  destPath: string,
-  redirectCount = 0
+  user: string,
+  pass: string,
+  destPath: string
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (redirectCount > 10) return reject(new Error("Too many redirects"));
-    const parsedUrl = new URL(url);
-    const isHttps = parsedUrl.protocol === "https:";
-    const lib = isHttps ? https : http;
-    const headers: Record<string, string> = { "User-Agent": "GRACE-LWE-Explorer/1.0" };
-    if (url.includes("earthdata.nasa.gov") || url.includes("urs.earthdata.nasa.gov")) {
-      headers["Authorization"] = authHeader;
-    }
-    const req = lib.get(
-      { hostname: parsedUrl.hostname, path: parsedUrl.pathname + parsedUrl.search, headers },
-      (res) => {
-        const { statusCode, headers: resHeaders } = res;
-        if ([301,302,303,307,308].includes(statusCode!)) {
-          const location = resHeaders.location as string;
-          if (!location) return reject(new Error("Redirect with no location"));
-          res.resume();
-          return downloadWithRedirects(location, authHeader, destPath, redirectCount + 1).then(resolve).catch(reject);
+    const { spawn } = require("child_process");
+    // curl handles NASA Earthdata's multi-step redirect/cookie auth natively
+    const args = [
+      "--location",           // follow all redirects
+      "--cookie-jar", "/tmp/nasa_cookies.txt",
+      "--cookie", "/tmp/nasa_cookies.txt",
+      "--user", `${user}:${pass}`,
+      "--output", destPath,
+      "--progress-bar",
+      "--max-time", "600",    // 10 min timeout
+      "--retry", "3",
+      url
+    ];
+    console.log("[GRACE] Starting curl download...");
+    const proc = spawn("curl", args);
+    proc.stdout.on("data", (d: Buffer) => {
+      const line = d.toString().trim();
+      if (line) { loadProgress = `downloading: ${line}`; console.log("[curl]", line); }
+    });
+    proc.stderr.on("data", (d: Buffer) => {
+      const line = d.toString().trim();
+      if (line) { loadProgress = `downloading...`; }
+    });
+    proc.on("close", (code: number) => {
+      if (code === 0) {
+        // Verify file is a real netCDF (not an HTML error page)
+        const stats = fs.existsSync(destPath) ? fs.statSync(destPath) : null;
+        if (!stats || stats.size < 1000000) {
+          const content = fs.existsSync(destPath) ? fs.readFileSync(destPath, "utf8").slice(0, 200) : "missing";
+          reject(new Error(`Download produced invalid file (${stats?.size ?? 0} bytes): ${content}`));
+        } else {
+          console.log(`[GRACE] Download complete: ${(stats.size/1024/1024).toFixed(1)} MB`);
+          resolve();
         }
-        if (statusCode !== 200) {
-          let body = "";
-          res.on("data", (c) => (body += c));
-          res.on("end", () => reject(new Error(`HTTP ${statusCode}: ${body.slice(0, 300)}`)));
-          return;
-        }
-        const totalBytes = parseInt(resHeaders["content-length"] as string || "0", 10);
-        let downloaded = 0;
-        const ws = fs.createWriteStream(destPath);
-        res.on("data", (chunk) => {
-          downloaded += chunk.length;
-          if (totalBytes > 0) {
-            const pct = ((downloaded / totalBytes) * 100).toFixed(1);
-            loadProgress = `downloading ${pct}% (${(downloaded/1024/1024).toFixed(1)} MB)`;
-          }
-        });
-        res.pipe(ws);
-        ws.on("finish", resolve);
-        ws.on("error", reject);
-        res.on("error", reject);
+      } else {
+        reject(new Error(`curl exited with code ${code}`));
       }
-    );
-    req.on("error", reject);
-    req.setTimeout(180000, () => { req.destroy(); reject(new Error("Download timeout")); });
+    });
+    proc.on("error", (err: Error) => reject(new Error(`curl spawn failed: ${err.message}`)));
   });
 }
 
@@ -100,11 +95,9 @@ export async function loadGraceData(): Promise<void> {
   // Step 1: download netCDF if needed
   if (!fs.existsSync(NC_FILE)) {
     loadProgress = "downloading GRACE data from NASA Earthdata...";
-    console.log("[GRACE] Downloading GRACE netCDF...");
-    const authHeader = "Basic " + Buffer.from(`${EARTHDATA_USER}:${EARTHDATA_PASS}`).toString("base64");
+    console.log("[GRACE] Downloading GRACE netCDF via curl...");
     try {
-      await downloadWithRedirects(GRACE_URL, authHeader, NC_FILE);
-      console.log("[GRACE] Download complete.");
+      await downloadWithCurl(GRACE_URL, EARTHDATA_USER, EARTHDATA_PASS, NC_FILE);
     } catch (err: any) {
       loadError = `Download failed: ${err.message}`;
       loadProgress = "error";
