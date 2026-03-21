@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import {
@@ -116,6 +116,25 @@ export default function GraceExplorer() {
   // Drainage / rivers overlay
   const [riversOn, setRiversOn] = useState(false);
   const riversLayerRef = useRef<L.TileLayer | null>(null);
+
+  // Watershed toggles: L5 (coarse), L6, L7 (fine) — from WWF HydroSHEDS
+  const [wsL5On, setWsL5On] = useState(false);
+  const [wsL6On, setWsL6On] = useState(false);
+  const [wsL7On, setWsL7On] = useState(false);
+  const wsL5OnRef = useRef(false);
+  const wsL6OnRef = useRef(false);
+  const wsL7OnRef = useRef(false);
+  useEffect(() => { wsL5OnRef.current = wsL5On; }, [wsL5On]);
+  useEffect(() => { wsL6OnRef.current = wsL6On; }, [wsL6On]);
+  useEffect(() => { wsL7OnRef.current = wsL7On; }, [wsL7On]);
+  const wsL5Ref = useRef<L.GeoJSON | null>(null);
+  const wsL6Ref = useRef<L.GeoJSON | null>(null);
+  const wsL7Ref = useRef<L.GeoJSON | null>(null);
+  const wsLoadingRef = useRef<{[k: string]: boolean}>({ l5: false, l6: false, l7: false });
+  // Stable refs to fetch functions so the map moveend handler can call them
+  const fetchWsL5Ref = useRef<(() => void) | null>(null);
+  const fetchWsL6Ref = useRef<(() => void) | null>(null);
+  const fetchWsL7Ref = useRef<(() => void) | null>(null);
 
   const drawModeRef = useRef<DrawMode>("point");
   const rectStepRef = useRef<0 | 1>(0);
@@ -294,6 +313,76 @@ export default function GraceExplorer() {
     }
   }, [reliefOpacity]);
 
+  // Helper: fetch watershed GeoJSON for the current map bounds
+  const fetchWatershedLayer = useCallback(async (
+    layerId: number,
+    key: "l5" | "l6" | "l7",
+    ref: React.MutableRefObject<L.GeoJSON | null>,
+    color: string
+  ) => {
+    if (!leafletMap.current || wsLoadingRef.current[key]) return;
+    wsLoadingRef.current[key] = true;
+    try {
+      const b = leafletMap.current.getBounds();
+      const bbox = `${b.getWest()},${b.getSouth()},${b.getEast()},${b.getNorth()}`;
+      const url = `https://wwf-sight-maps.org/arcgis/rest/services/Global/Hydrology/MapServer/${layerId}/query` +
+        `?where=1%3D1&geometry=${encodeURIComponent(bbox)}&geometryType=esriGeometryEnvelope&inSR=4326` +
+        `&spatialRel=esriSpatialRelIntersects&outFields=PFAF_ID%2CSUB_AREA&f=geojson&resultRecordCount=200`;
+      const resp = await fetch(url);
+      const data = await resp.json();
+      if (!leafletMap.current) return;
+      // Remove old layer
+      if (ref.current) { leafletMap.current.removeLayer(ref.current); ref.current = null; }
+      ref.current = L.geoJSON(data, {
+        style: {
+          color, weight: 1.5, fill: true,
+          fillColor: color, fillOpacity: 0.08, opacity: 0.75, interactive: false,
+        },
+      }).addTo(leafletMap.current);
+      // Keep watersheds below GRACE/AOI
+      if (tileLayerRef.current) tileLayerRef.current.bringToFront();
+      if (aoiLayerRef.current)  aoiLayerRef.current.bringToFront();
+    } catch (_) { /* ignore fetch errors */ } finally {
+      wsLoadingRef.current[key] = false;
+    }
+  }, []);
+
+  // Bind stable fetch functions for use in map moveend handler
+  const fetchL5 = useCallback(() => fetchWatershedLayer(5, "l5", wsL5Ref, "#f97316"), [fetchWatershedLayer]);
+  const fetchL6 = useCallback(() => fetchWatershedLayer(6, "l6", wsL6Ref, "#facc15"), [fetchWatershedLayer]);
+  const fetchL7 = useCallback(() => fetchWatershedLayer(7, "l7", wsL7Ref, "#a3e635"), [fetchWatershedLayer]);
+  useEffect(() => { fetchWsL5Ref.current = fetchL5; }, [fetchL5]);
+  useEffect(() => { fetchWsL6Ref.current = fetchL6; }, [fetchL6]);
+  useEffect(() => { fetchWsL7Ref.current = fetchL7; }, [fetchL7]);
+
+  // Sync watershed overlays when toggled on/off
+  useEffect(() => {
+    if (!leafletMap.current) return;
+    if (!wsL5On) {
+      if (wsL5Ref.current) { leafletMap.current.removeLayer(wsL5Ref.current); wsL5Ref.current = null; }
+    } else {
+      fetchL5();
+    }
+  }, [wsL5On, fetchL5]);
+
+  useEffect(() => {
+    if (!leafletMap.current) return;
+    if (!wsL6On) {
+      if (wsL6Ref.current) { leafletMap.current.removeLayer(wsL6Ref.current); wsL6Ref.current = null; }
+    } else {
+      fetchL6();
+    }
+  }, [wsL6On, fetchL6]);
+
+  useEffect(() => {
+    if (!leafletMap.current) return;
+    if (!wsL7On) {
+      if (wsL7Ref.current) { leafletMap.current.removeLayer(wsL7Ref.current); wsL7Ref.current = null; }
+    } else {
+      fetchL7();
+    }
+  }, [wsL7On, fetchL7]);
+
   // Sync rivers/drainage overlay
   useEffect(() => {
     if (!leafletMap.current) return;
@@ -302,9 +391,9 @@ export default function GraceExplorer() {
     } else {
       if (!riversLayerRef.current) {
         riversLayerRef.current = L.tileLayer(
-          "https://tiles.arcgis.com/tiles/P3ePLMYs2RVChkJx/arcgis/rest/services/Esri_Hydro_Reference_Overlay/MapServer/tile/{z}/{y}/{x}",
+          "https://tiles.arcgis.com/tiles/iQ1dY19aHwbSDYIF/arcgis/rest/services/detailed_rivers/MapServer/tile/{z}/{y}/{x}",
           { opacity: 1.0, maxZoom: 19,
-            attribution: 'Hydrology &copy; <a href="https://www.esri.com/">Esri</a>' }
+            attribution: 'Rivers &copy; <a href="https://www.esri.com/">Esri</a> | <a href="https://www.hydrosheds.org">HydroSHEDS</a>' }
         );
         riversLayerRef.current.addTo(leafletMap.current);
       }
@@ -508,6 +597,13 @@ export default function GraceExplorer() {
       }
     };
     window.addEventListener("keydown", onKey);
+
+    // Refresh active watershed layers on map move/zoom
+    map.on("moveend", () => {
+      if (wsL5OnRef.current) fetchWsL5Ref.current?.();
+      if (wsL6OnRef.current) fetchWsL6Ref.current?.();
+      if (wsL7OnRef.current) fetchWsL7Ref.current?.();
+    });
 
     leafletMap.current = map;
     return () => { window.removeEventListener("keydown", onKey); map.remove(); leafletMap.current = null; };
@@ -883,7 +979,6 @@ export default function GraceExplorer() {
           {/* RIVERS / DRAINAGE TOGGLE */}
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
             <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
-              {/* wavy river lines */}
               <path d="M1 4 Q3 2 5 4 Q7 6 9 4 Q11 2 13 4" stroke="#38bdf8" strokeWidth="1.3" fill="none" strokeLinecap="round"/>
               <path d="M1 8 Q3 6 5 8 Q7 10 9 8 Q11 6 13 8" stroke="#38bdf8" strokeWidth="1.1" fill="none" strokeLinecap="round" strokeOpacity="0.7"/>
               <path d="M4 11 Q5.5 9.5 7 11" stroke="#38bdf8" strokeWidth="0.9" fill="none" strokeLinecap="round" strokeOpacity="0.5"/>
@@ -891,7 +986,7 @@ export default function GraceExplorer() {
             <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>Rivers</span>
             <button
               onClick={() => setRiversOn(v => !v)}
-              title={riversOn ? "Hide drainage/rivers overlay" : "Show drainage/rivers overlay"}
+              title={riversOn ? "Hide HydroRIVERS drainage" : "Show HydroRIVERS detailed drainage"}
               style={{
                 width: 36, height: 18, borderRadius: 9, border: "none", cursor: "pointer", position: "relative",
                 background: riversOn ? "#0ea5e9" : "#30363d",
@@ -907,6 +1002,35 @@ export default function GraceExplorer() {
             <span style={{ fontSize: "10px", color: riversOn ? "#38bdf8" : "#484f58", fontFamily: "monospace", width: 20 }}>
               {riversOn ? "on" : "off"}
             </span>
+          </div>
+
+          {/* WATERSHED LEVEL TOGGLES */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
+            <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
+              <path d="M1 13 L4 8 L7 11 L10 5 L13 2" stroke="#f97316" strokeWidth="1.3" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+              <path d="M1 13 L4 8 L7 11 L10 5 L13 2 L13 13 Z" fill="#f97316" fillOpacity="0.15"/>
+            </svg>
+            <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>Watersheds</span>
+            {([
+              { label: "L5", on: wsL5On, toggle: () => setWsL5On(v => !v), color: "#f97316", title: "Level 5 — coarse basins (~300 globally)" },
+              { label: "L6", on: wsL6On, toggle: () => setWsL6On(v => !v), color: "#facc15", title: "Level 6 — medium sub-basins (~1,300 globally)" },
+              { label: "L7", on: wsL7On, toggle: () => setWsL7On(v => !v), color: "#a3e635", title: "Level 7 — fine sub-basins (~4,700 globally)" },
+            ]).map(({ label, on, toggle, color, title }) => (
+              <button
+                key={label}
+                onClick={toggle}
+                title={title}
+                style={{
+                  padding: "2px 7px", fontSize: "10px", fontWeight: on ? 700 : 400,
+                  borderRadius: 4, border: `1px solid ${on ? color : "#30363d"}`,
+                  background: on ? `${color}22` : "#0d1117",
+                  color: on ? color : "#6e7681",
+                  cursor: "pointer", transition: "all 0.15s",
+                }}
+              >
+                {label}
+              </button>
+            ))}
           </div>
 
           {/* Divider */}
