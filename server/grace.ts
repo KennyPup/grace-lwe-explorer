@@ -2,17 +2,13 @@ import fs from "fs";
 import path from "path";
 
 const DATA_DIR = path.join(process.cwd(), "data");
-const NC_FILE = path.join(DATA_DIR, "grace_mascon.nc");
 const META_FILE = path.join(DATA_DIR, "grace_meta.json");
 const BIN_FILE = path.join(DATA_DIR, "grace_lwe.bin");
+const BIN_GZ_FILE = path.join(DATA_DIR, "grace_lwe.bin.gz");
 
-// The GRACE RL06.3 CRI-filtered Mascon file — single global netCDF
-const GRACE_URL =
-  "https://archive.podaac.earthdata.nasa.gov/podaac-ops-cumulus-protected/TELLUS_GRAC-GRFO_MASCON_CRI_GRID_RL06.3_V4/GRCTellus.JPL.200204_202601.GLO.RL06.3M.MSCNv04CRI.nc";
-
-// NASA Earthdata credentials — update if account requires password reset
-const EARTHDATA_USER = process.env.EARTHDATA_USER || "kchgeo";
-const EARTHDATA_PASS = process.env.EARTHDATA_PASS || "1MoyaleHydro!";
+// Pre-processed data hosted on GitHub Releases (9.4MB compressed vs 251MB raw)
+const GITHUB_BIN_URL = "https://github.com/KennyPup/grace-lwe-explorer/releases/download/v1.0-data/grace_lwe.bin.gz";
+const GITHUB_META_URL = "https://github.com/KennyPup/grace-lwe-explorer/releases/download/v1.0-data/grace_meta.json";
 
 // In-memory parsed data
 let lats: number[] = [];
@@ -26,111 +22,60 @@ let loaded = false;
 let loadError: string | null = null;
 let loadProgress = "idle";
 
-async function getEarthdataToken(user: string, pass: string): Promise<string> {
-  const { execSync } = require("child_process");
-  const auth = `--user "${user}:${pass}"`;
-  // First try to reuse an existing token (NASA allows max 2)
-  console.log("[GRACE] Checking for existing Earthdata tokens...");
-  const listResult = execSync(
-    `curl -s https://urs.earthdata.nasa.gov/api/users/tokens ${auth}`,
-    { encoding: "utf8" }
-  );
-  const existing = JSON.parse(listResult);
-  if (Array.isArray(existing) && existing.length > 0 && existing[0].access_token) {
-    console.log("[GRACE] Reusing existing bearer token, expires:", existing[0].expiration_date);
-    return existing[0].access_token;
-  }
-  // No existing token — create one
-  console.log("[GRACE] Creating new Earthdata bearer token...");
-  const result = execSync(
-    `curl -s -X POST https://urs.earthdata.nasa.gov/api/users/token ${auth}`,
-    { encoding: "utf8" }
-  );
-  const json = JSON.parse(result);
-  if (!json.access_token) throw new Error(`Token fetch failed: ${result}`);
-  console.log("[GRACE] Got bearer token, expires:", json.expiration_date);
-  return json.access_token;
-}
-
-function downloadWithCurl(
-  url: string,
-  token: string,
-  destPath: string
-): Promise<void> {
+function curlDownload(url: string, destPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const { spawn } = require("child_process");
-    const args = [
-      "--location",
-      "-H", `Authorization: Bearer ${token}`,
-      "--output", destPath,
-      "--max-time", "600",
-      "--retry", "3",
-      url
-    ];
-    console.log("[GRACE] Starting curl download with bearer token...");
+    const args = ["--location", "--silent", "--output", destPath, "--max-time", "120", "--retry", "3", url];
     const proc = spawn("curl", args);
-    proc.stderr.on("data", (d: Buffer) => {
-      const line = d.toString().trim();
-      if (line) { loadProgress = `downloading...`; }
-    });
-    proc.on("close", (code: number) => {
-      if (code === 0) {
-        const stats = fs.existsSync(destPath) ? fs.statSync(destPath) : null;
-        if (!stats || stats.size < 1000000) {
-          const content = fs.existsSync(destPath) ? fs.readFileSync(destPath, "utf8").slice(0, 200) : "missing";
-          reject(new Error(`Download produced invalid file (${stats?.size ?? 0} bytes): ${content}`));
-        } else {
-          console.log(`[GRACE] Download complete: ${(stats.size/1024/1024).toFixed(1)} MB`);
-          resolve();
-        }
-      } else {
-        reject(new Error(`curl exited with code ${code}`));
-      }
-    });
-    proc.on("error", (err: Error) => reject(new Error(`curl spawn failed: ${err.message}`)));
-  });
-}
-
-function runPython(script: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const { spawn } = require("child_process");
-    const proc = spawn("python3", [script], { cwd: process.cwd() });
-    let out = "";
-    proc.stdout.on("data", (d: Buffer) => { out += d; console.log("[python]", d.toString().trim()); });
-    proc.stderr.on("data", (d: Buffer) => { console.error("[python err]", d.toString().trim()); });
     proc.on("close", (code: number) => {
       if (code === 0) resolve();
-      else reject(new Error(`Python exited ${code}: ${out}`));
+      else reject(new Error(`curl exited ${code} downloading ${url}`));
     });
+    proc.on("error", (err: Error) => reject(err));
   });
 }
+
 
 export async function loadGraceData(): Promise<void> {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-  // Step 1: download netCDF if needed
-  if (!fs.existsSync(NC_FILE)) {
-    loadProgress = "downloading GRACE data from NASA Earthdata...";
-    console.log("[GRACE] Downloading GRACE netCDF via curl...");
+  // Step 1: download pre-processed binary from GitHub Releases (9.4MB gz, no NASA auth needed)
+  if (!fs.existsSync(BIN_FILE)) {
+    // Download and decompress gz
+    if (!fs.existsSync(BIN_GZ_FILE)) {
+      loadProgress = "downloading GRACE data (~9MB)...";
+      console.log("[GRACE] Downloading pre-processed binary from GitHub...");
+      try {
+        await curlDownload(GITHUB_BIN_URL, BIN_GZ_FILE);
+        console.log(`[GRACE] Downloaded: ${(fs.statSync(BIN_GZ_FILE).size/1024/1024).toFixed(1)} MB`);
+      } catch (err: any) {
+        loadError = `Binary download failed: ${err.message}`;
+        loadProgress = "error";
+        return;
+      }
+    }
+    // Decompress
+    loadProgress = "decompressing GRACE data...";
+    console.log("[GRACE] Decompressing binary...");
     try {
-      const token = await getEarthdataToken(EARTHDATA_USER, EARTHDATA_PASS);
-      await downloadWithCurl(GRACE_URL, token, NC_FILE);
+      const { execSync } = require("child_process");
+      execSync(`gunzip -k "${BIN_GZ_FILE}"`, { cwd: DATA_DIR });
+      console.log(`[GRACE] Decompressed: ${(fs.statSync(BIN_FILE).size/1024/1024).toFixed(1)} MB`);
     } catch (err: any) {
-      loadError = `Download failed: ${err.message}`;
+      loadError = `Decompress failed: ${err.message}`;
       loadProgress = "error";
       return;
     }
   }
 
-  // Step 2: pre-process with Python if binary not yet generated
-  if (!fs.existsSync(BIN_FILE) || !fs.existsSync(META_FILE)) {
-    loadProgress = "pre-processing netCDF (Python)...";
-    console.log("[GRACE] Running Python pre-processor...");
-    const pyScript = path.join(process.cwd(), "preprocess_grace.py");
+  // Step 2: download metadata JSON if needed
+  if (!fs.existsSync(META_FILE)) {
+    loadProgress = "downloading GRACE metadata...";
+    console.log("[GRACE] Downloading metadata from GitHub...");
     try {
-      await runPython(pyScript);
+      await curlDownload(GITHUB_META_URL, META_FILE);
     } catch (err: any) {
-      loadError = `Pre-process failed: ${err.message}`;
+      loadError = `Metadata download failed: ${err.message}`;
       loadProgress = "error";
       return;
     }
