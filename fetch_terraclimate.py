@@ -7,7 +7,7 @@ Usage:
 
 Outputs JSON to stdout.
 Variables: ppt (precip, mm), aet (actual ET, mm), ro (runoff, mm)
-Years: 2002–2024 (matching GRACE range)
+Years: 2002–2025 (matching GRACE range)
 Resolution: ~4km (1/24°), monthly values
 
 NOTE: netCDF4 auto-applies scale_factor & add_offset when reading.
@@ -25,7 +25,7 @@ BASE_URL = "http://thredds.northwestknowledge.net/thredds/dodsC/TERRACLIMATE_ALL
 
 VARS = ["ppt", "aet", "q"]   # q = runoff (TerraClimate uses 'q' not 'ro')
 START_YEAR = 2002
-END_YEAR = 2024
+END_YEAR = 2025
 
 # TerraClimate grid: 1/24° resolution
 # lat[i] = 89.97916667 - i * (1/24), lon[j] = -179.97916667 + j * (1/24)

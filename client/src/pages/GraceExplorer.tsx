@@ -764,7 +764,7 @@ export default function GraceExplorer() {
       const monthlyAet = tcResult.variables.aet.monthly;
       const monthlyRo  = tcResult.variables.q.monthly;
       header  = `Month,Precip (mm),Actual ET (mm),Runoff (mm)`;
-      resNote = `# Time resolution: monthly values (2002–2024 full series)`;
+      resNote = `# Time resolution: monthly values (2002–2025 full series)`;
       dataRows = monthlyPpt.map((d, i) => {
         const p = d.value  !== null ? d.value!.toFixed(1)              : "";
         const a = monthlyAet[i]?.value !== null ? monthlyAet[i]?.value!.toFixed(1) : "";
@@ -772,12 +772,12 @@ export default function GraceExplorer() {
         return `${d.month},${p},${a},${r}`;
       });
     } else if (isClimatology) {
-      // Climatological mean by calendar month (Jan–Dec averages across 2002–2024)
+      // Climatological mean by calendar month (Jan–Dec averages across 2002–2025)
       const mmPpt = tcResult.variables.ppt.monthly_means;
       const mmAet = tcResult.variables.aet.monthly_means;
       const mmRo  = tcResult.variables.q.monthly_means;
       header  = `Month,Precip (mm),Actual ET (mm),Runoff (mm)`;
-      resNote = `# Time resolution: climatological monthly mean (average across 2002–2024)`;
+      resNote = `# Time resolution: climatological monthly mean (average across 2002–2025)`;
       dataRows = MONTH_LABELS.map((lbl, i) => {
         const p = mmPpt[i] !== null ? mmPpt[i]!.toFixed(1) : "";
         const a = mmAet[i] !== null ? mmAet[i]!.toFixed(1) : "";
@@ -878,7 +878,7 @@ export default function GraceExplorer() {
     if (tcChartMode === "annual") {
       return tcResult.variables[varKey].annual.map((d) => ({ label: String(d.year), value: d.value }));
     } else if (tcChartMode === "monthly_series") {
-      // Full monthly time series (2002-01 through 2024-12)
+      // Full monthly time series (2002-01 through 2025-12)
       return tcResult.variables[varKey].monthly
         .filter((d) => d.value !== null)
         .map((d) => ({ label: d.month, value: d.value }));
@@ -1190,7 +1190,7 @@ export default function GraceExplorer() {
               <span style={{ fontWeight: 700, fontSize: "11px", color: "#e6edf3", textTransform: "uppercase", letterSpacing: "0.07em" }}>TerraClimate</span>
             </div>
             <div style={{ fontSize: "10px", color: "#6e7681", lineHeight: 1.5 }}>
-              Monthly climate water balance · 2002–2024
+              Monthly climate water balance · 2002–2025
             </div>
           </div>
 
@@ -1273,7 +1273,7 @@ export default function GraceExplorer() {
                   <button
                     onClick={downloadTCGeoTIFF}
                     disabled={tcTiffLoading}
-                    title="Download annual GeoTIFFs (zip) — ppt, aet, q — one raster per variable per year"
+                    title="Download GeoTIFFs (zip) — annual totals + monthly climatology — ppt, aet, q"
                     style={{
                       display: "flex", alignItems: "center", gap: 4,
                       padding: "2px 8px", fontSize: "10px", fontWeight: 600,
