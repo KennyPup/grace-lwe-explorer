@@ -699,6 +699,46 @@ export default function GraceExplorer() {
     URL.revokeObjectURL(url);
   }, [queryResult, locationName, chartMode]);
 
+  // GeoTIFF export — download zip of annual rasters for the current AOI
+  const [tiffLoading, setTiffLoading] = useState(false);
+  const downloadGeoTIFF = useCallback(async () => {
+    if (!queryResult || tiffLoading) return;
+    setTiffLoading(true);
+    try {
+      const isBbox = queryResult.bbox !== undefined;
+      let url = "/api/export/geotiff";
+      if (isBbox && queryResult.bbox) {
+        const b = queryResult.bbox;
+        url += `?minLat=${b.minLat}&maxLat=${b.maxLat}&minLon=${b.minLon}&maxLon=${b.maxLon}`;
+      } else if (queryResult.lat !== undefined && queryResult.lon !== undefined) {
+        // Single point — export just that one 0.5° tile
+        const half = 0.25;
+        url += `?minLat=${(queryResult.lat - half).toFixed(3)}&maxLat=${(queryResult.lat + half).toFixed(3)}&minLon=${(queryResult.lon - half).toFixed(3)}&maxLon=${(queryResult.lon + half).toFixed(3)}`;
+      }
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ error: resp.statusText }));
+        alert("GeoTIFF export failed: " + (err.error || resp.statusText));
+        return;
+      }
+      const blob = await resp.blob();
+      const a = document.createElement("a");
+      const objUrl = URL.createObjectURL(blob);
+      a.href = objUrl;
+      // Derive filename from content-disposition or build one
+      const cd = resp.headers.get("content-disposition") || "";
+      const fnMatch = cd.match(/filename="([^"]+)"/);
+      const name = locationName || "Region";
+      a.download = fnMatch ? fnMatch[1] : `GRACE_LWE_GeoTIFFs_${name.replace(/[^a-z0-9_\-]/gi, "_").slice(0, 30)}.zip`;
+      a.click();
+      URL.revokeObjectURL(objUrl);
+    } catch (e: any) {
+      alert("GeoTIFF export error: " + e.message);
+    } finally {
+      setTiffLoading(false);
+    }
+  }, [queryResult, locationName, tiffLoading]);
+
   // TerraClimate CSV download — matches currently selected chart mode (annual or monthly full series)
   const downloadTCCSV = useCallback(() => {
     if (!tcResult) return;
@@ -1372,7 +1412,7 @@ export default function GraceExplorer() {
             const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
             return (
               <>
-                {/* Toggle + CSV */}
+                {/* Toggle + CSV + GeoTIFF */}
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 14px", borderBottom: "1px solid #30363d" }}>
                   <div style={{ display: "flex", background: "#0d1117", border: "1px solid #30363d", borderRadius: 6, overflow: "hidden" }}>
                     {(["annual", "monthly"] as ChartMode[]).map((m) => (
@@ -1386,22 +1426,56 @@ export default function GraceExplorer() {
                       </button>
                     ))}
                   </div>
-                  <button
-                    onClick={downloadCSV}
-                    style={{
-                      display: "flex", alignItems: "center", gap: 5,
-                      padding: "3px 10px", fontSize: "11px", fontWeight: 600,
-                      background: "#0d1117", border: "1px solid #30363d",
-                      borderRadius: 6, color: "#8b949e", cursor: "pointer",
-                    }}
-                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.borderColor = "#22d3ee"; (e.currentTarget as HTMLButtonElement).style.color = "#22d3ee"; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.borderColor = "#30363d"; (e.currentTarget as HTMLButtonElement).style.color = "#8b949e"; }}
-                  >
-                    <svg viewBox="0 0 16 16" width="12" height="12" fill="none">
-                      <path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-                    </svg>
-                    CSV
-                  </button>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {/* CSV download */}
+                    <button
+                      onClick={downloadCSV}
+                      title="Download CSV"
+                      style={{
+                        display: "flex", alignItems: "center", gap: 5,
+                        padding: "3px 10px", fontSize: "11px", fontWeight: 600,
+                        background: "#0d1117", border: "1px solid #30363d",
+                        borderRadius: 6, color: "#8b949e", cursor: "pointer",
+                      }}
+                      onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.borderColor = "#22d3ee"; (e.currentTarget as HTMLButtonElement).style.color = "#22d3ee"; }}
+                      onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.borderColor = "#30363d"; (e.currentTarget as HTMLButtonElement).style.color = "#8b949e"; }}
+                    >
+                      <svg viewBox="0 0 16 16" width="12" height="12" fill="none">
+                        <path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                      </svg>
+                      CSV
+                    </button>
+                    {/* GeoTIFF zip download */}
+                    <button
+                      onClick={downloadGeoTIFF}
+                      disabled={tiffLoading}
+                      title="Download annual GeoTIFFs (zip) — one raster per year, WGS84, LZW compressed"
+                      style={{
+                        display: "flex", alignItems: "center", gap: 5,
+                        padding: "3px 10px", fontSize: "11px", fontWeight: 600,
+                        background: tiffLoading ? "#0e2a1a" : "#0d1117",
+                        border: `1px solid ${tiffLoading ? "#22c55e" : "#30363d"}`,
+                        borderRadius: 6,
+                        color: tiffLoading ? "#22c55e" : "#8b949e",
+                        cursor: tiffLoading ? "wait" : "pointer",
+                        opacity: tiffLoading ? 0.8 : 1,
+                      }}
+                      onMouseEnter={(e) => { if (!tiffLoading) { (e.currentTarget as HTMLButtonElement).style.borderColor = "#22c55e"; (e.currentTarget as HTMLButtonElement).style.color = "#22c55e"; } }}
+                      onMouseLeave={(e) => { if (!tiffLoading) { (e.currentTarget as HTMLButtonElement).style.borderColor = "#30363d"; (e.currentTarget as HTMLButtonElement).style.color = "#8b949e"; } }}
+                    >
+                      {tiffLoading ? (
+                        <svg viewBox="0 0 16 16" width="12" height="12" fill="none" style={{ animation: "spin 1s linear infinite" }}>
+                          <circle cx="8" cy="8" r="6" stroke="#22c55e" strokeWidth="1.5" strokeDasharray="20 10" strokeLinecap="round"/>
+                        </svg>
+                      ) : (
+                        <svg viewBox="0 0 16 16" width="12" height="12" fill="none">
+                          <rect x="2" y="2" width="12" height="12" rx="1.5" stroke="currentColor" strokeWidth="1.4"/>
+                          <path d="M5 8h6M8 5v6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+                        </svg>
+                      )}
+                      {tiffLoading ? "Building…" : "GeoTIFF"}
+                    </button>
+                  </div>
                 </div>
 
                 {/* Chart — shown first, before stats/table */}

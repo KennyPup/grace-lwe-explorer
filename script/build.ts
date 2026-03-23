@@ -1,6 +1,6 @@
 import { build as esbuild } from "esbuild";
 import { build as viteBuild } from "vite";
-import { rm, readFile } from "fs/promises";
+import { rm, readFile, copyFile } from "fs/promises";
 
 // server deps to bundle to reduce openat(2) syscalls
 // which helps cold start times
@@ -57,6 +57,10 @@ async function buildAll() {
     external: externals,
     logLevel: "info",
   });
+
+  // Copy Python GeoTIFF export script into dist so it's available in production
+  await copyFile("server/export_geotiff.py", "dist/export_geotiff.py");
+  console.log("copied export_geotiff.py to dist/");
 }
 
 buildAll().catch((err) => {
