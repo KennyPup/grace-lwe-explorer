@@ -776,13 +776,14 @@ export default function GraceExplorer() {
       const mmPpt = tcResult.variables.ppt.monthly_means;
       const mmAet = tcResult.variables.aet.monthly_means;
       const mmRo  = tcResult.variables.q.monthly_means;
-      header  = `Month,Precip (mm),Actual ET (mm),Runoff (mm)`;
+      header  = `Month,Precip (mm),Actual ET (mm),Runoff (mm),Baseflow (mm)`;
       resNote = `# Time resolution: climatological monthly mean (average across 2002–2025)`;
       dataRows = MONTH_LABELS.map((lbl, i) => {
-        const p = mmPpt[i] !== null ? mmPpt[i]!.toFixed(1) : "";
-        const a = mmAet[i] !== null ? mmAet[i]!.toFixed(1) : "";
-        const r = mmRo[i]  !== null ? mmRo[i]!.toFixed(1)  : "";
-        return `${lbl},${p},${a},${r}`;
+        const p  = mmPpt[i] !== null ? mmPpt[i]!.toFixed(1) : "";
+        const a  = mmAet[i] !== null ? mmAet[i]!.toFixed(1) : "";
+        const r  = mmRo[i]  !== null ? mmRo[i]!.toFixed(1)  : "";
+        const bf = baseflowMeans[i] !== null ? baseflowMeans[i]!.toFixed(1) : "";
+        return `${lbl},${p},${a},${r},${bf}`;
       });
     } else {
       const annualPpt = tcResult.variables.ppt.annual;
@@ -888,12 +889,27 @@ export default function GraceExplorer() {
     }
   }
 
-  const TC_COLORS: Record<string, string> = { ppt: "#60a5fa", aet: "#34d399", q: "#a78bfa" };
-  const TC_LABELS: Record<string, string> = { ppt: "Precip (mm)", aet: "Actual ET (mm)", q: "Runoff (mm)" };
-  const TC_UNITS: Record<string, string> = { ppt: "mm", aet: "mm", q: "mm" };
+  const TC_COLORS: Record<string, string> = { ppt: "#60a5fa", aet: "#34d399", q: "#a78bfa", bf: "#fb923c" };
+  const TC_LABELS: Record<string, string> = { ppt: "Precip (mm)", aet: "Actual ET (mm)", q: "Runoff (mm)", bf: "Baseflow (mm)" };
+  const TC_UNITS: Record<string, string> = { ppt: "mm", aet: "mm", q: "mm", bf: "mm" };
 
-  function TCBarChart({ varKey }: { varKey: "ppt" | "aet" | "q" }) {
-    const data = tcChartData(varKey);
+  // Baseflow = max(0, ppt - aet - q), computed from monthly_means only
+  const baseflowMeans: (number | null)[] = (() => {
+    if (!tcResult) return Array(12).fill(null);
+    const mmP = tcResult.variables.ppt.monthly_means;
+    const mmA = tcResult.variables.aet.monthly_means;
+    const mmQ = tcResult.variables.q.monthly_means;
+    return MONTH_LABELS.map((_, i) => {
+      const p = mmP[i], a = mmA[i], q = mmQ[i];
+      if (p === null || a === null || q === null) return null;
+      return Math.max(0, p - a - q);
+    });
+  })();
+
+  function TCBarChart({ varKey }: { varKey: "ppt" | "aet" | "q" | "bf" }) {
+    const data = varKey === "bf"
+      ? baseflowMeans.map((v, i) => ({ label: MONTH_LABELS[i], value: v }))
+      : tcChartData(varKey as "ppt" | "aet" | "q");
     const color = TC_COLORS[varKey];
     return (
       <div style={{ height: 110, padding: "0 2px 0 0" }}>
@@ -1301,7 +1317,7 @@ export default function GraceExplorer() {
                 </div>
               </div>
 
-              {/* 3 charts */}
+              {/* 3 base charts (all modes) */}
               {(["ppt", "aet", "q"] as const).map((varKey) => {
                 const varData = tcResult.variables[varKey];
                 const annualVals = varData.annual.map((d) => d.value).filter((v): v is number => v !== null);
@@ -1324,6 +1340,27 @@ export default function GraceExplorer() {
                   </div>
                 );
               })}
+
+              {/* Baseflow chart — Mo. Mean mode only */}
+              {tcChartMode === "monthly_mean" && (() => {
+                const bfAvg = baseflowMeans.filter((v): v is number => v !== null);
+                const bfMean = bfAvg.length > 0 ? bfAvg.reduce((a, b) => a + b, 0) / bfAvg.length : 0;
+                return (
+                  <div style={{ borderBottom: "1px solid #21262d", padding: "8px 10px 4px", flexShrink: 0 }}>
+                    <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: 2, background: TC_COLORS.bf }}/>
+                        <span style={{ fontSize: "10px", fontWeight: 700, color: TC_COLORS.bf, textTransform: "uppercase", letterSpacing: "0.07em" }}>Baseflow</span>
+                        <span style={{ fontSize: "9px", color: "#484f58", fontStyle: "italic" }}>P − AET − Q ≥ 0</span>
+                      </div>
+                      <span style={{ fontSize: "10px", fontFamily: "monospace", color: "#8b949e" }}>
+                        avg {bfMean.toFixed(0)} mm/mo
+                      </span>
+                    </div>
+                    <TCBarChart varKey="bf" />
+                  </div>
+                );
+              })()}
 
               <div style={{ padding: "6px 12px", fontSize: 9, color: "#484f58", lineHeight: 1.5 }}>
                 TerraClimate · ~4km res · THREDDS OPeNDAP<br/>
