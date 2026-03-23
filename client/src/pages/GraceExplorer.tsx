@@ -700,22 +700,25 @@ export default function GraceExplorer() {
   }, [queryResult, locationName, chartMode]);
 
   // GeoTIFF export — download zip of annual rasters for the current AOI
+  // Must use the same API_BASE proxy prefix that apiRequest uses, otherwise
+  // raw fetch() breaks on the deployed Perplexity static site.
+  const API_BASE_TIFF = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
   const [tiffLoading, setTiffLoading] = useState(false);
   const downloadGeoTIFF = useCallback(async () => {
     if (!queryResult || tiffLoading) return;
     setTiffLoading(true);
     try {
       const isBbox = queryResult.bbox !== undefined;
-      let url = "/api/export/geotiff";
+      let path = "/api/export/geotiff";
       if (isBbox && queryResult.bbox) {
         const b = queryResult.bbox;
-        url += `?minLat=${b.minLat}&maxLat=${b.maxLat}&minLon=${b.minLon}&maxLon=${b.maxLon}`;
+        path += `?minLat=${b.minLat}&maxLat=${b.maxLat}&minLon=${b.minLon}&maxLon=${b.maxLon}`;
       } else if (queryResult.lat !== undefined && queryResult.lon !== undefined) {
         // Single point — export just that one 0.5° tile
         const half = 0.25;
-        url += `?minLat=${(queryResult.lat - half).toFixed(3)}&maxLat=${(queryResult.lat + half).toFixed(3)}&minLon=${(queryResult.lon - half).toFixed(3)}&maxLon=${(queryResult.lon + half).toFixed(3)}`;
+        path += `?minLat=${(queryResult.lat - half).toFixed(3)}&maxLat=${(queryResult.lat + half).toFixed(3)}&minLon=${(queryResult.lon - half).toFixed(3)}&maxLon=${(queryResult.lon + half).toFixed(3)}`;
       }
-      const resp = await fetch(url);
+      const resp = await fetch(`${API_BASE_TIFF}${path}`);
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({ error: resp.statusText }));
         alert("GeoTIFF export failed: " + (err.error || resp.statusText));
@@ -737,7 +740,7 @@ export default function GraceExplorer() {
     } finally {
       setTiffLoading(false);
     }
-  }, [queryResult, locationName, tiffLoading]);
+  }, [queryResult, locationName, tiffLoading, API_BASE_TIFF]);
 
   // TerraClimate CSV download — matches currently selected chart mode (annual or monthly full series)
   const downloadTCCSV = useCallback(() => {
