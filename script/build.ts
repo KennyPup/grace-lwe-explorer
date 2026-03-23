@@ -58,9 +58,10 @@ async function buildAll() {
     logLevel: "info",
   });
 
-  // Copy Python GeoTIFF export script into dist so it's available in production
-  await copyFile("server/export_geotiff.py", "dist/export_geotiff.py");
-  console.log("copied export_geotiff.py to dist/");
+  // Copy Python export scripts into dist so they're available in production
+  await copyFile("server/export_geotiff.py",    "dist/export_geotiff.py");
+  await copyFile("server/export_tc_geotiff.py", "dist/export_tc_geotiff.py");
+  console.log("copied export scripts to dist/");
 }
 
 buildAll().catch((err) => {

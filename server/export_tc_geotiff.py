@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+Generate annual mean TerraClimate GeoTIFFs from pre-fetched data.
+Pure Python — no GDAL/rasterio dependency.
+
+Reads JSON from stdin (provided by Node from cached TC results).
+Writes one GeoTIFF per variable per year into a zip file.
+
+For a POINT query : 1×1 pixel GeoTIFF at the TC grid cell (~4.6 km)
+For a BBOX query  : grid of pixels covering the bbox, each holding the
+                    spatial mean for that year (consistent with chart display)
+
+Usage:
+  echo '<json>' | python3 export_tc_geotiff.py <out_zip>
+
+JSON schema:
+  {
+    mode:      'point' | 'bbox'
+    lat:       float          (point only — TC grid centre)
+    lon:       float          (point only)
+    bbox:      {minLat, maxLat, minLon, maxLon}  (bbox only)
+    variables: {
+      ppt: { annual: [{year, value}, ...] },
+      aet: { annual: [...] },
+      q:   { annual: [...] }
+    }
+  }
+"""
+import sys, json, zipfile, io, struct, math
+import numpy as np
+from datetime import datetime
+
+
+# ── Variable metadata ──────────────────────────────────────────────────────
+VAR_META = {
+    'ppt': {'long_name': 'Precipitation',          'units': 'mm/year'},
+    'aet': {'long_name': 'Actual Evapotranspiration', 'units': 'mm/year'},
+    'q':   {'long_name': 'Runoff',                 'units': 'mm/year'},
+}
+
+TC_RES   = 1 / 24   # ~0.04167° per pixel (~4.6 km)
+LAT_MAX  =  89.97916667
+LON_MIN  = -179.97916667
+
+
+# ── Pure-Python GeoTIFF writer (identical logic to GRACE exporter) ──────────
+
+def write_geotiff(data2d, west, north, cell_deg, nodata=-9999.0):
+    """
+    data2d   : float32 array (nrows, ncols), row 0 = northernmost
+    Returns  : bytes of a valid GeoTIFF (WGS84 EPSG:4326)
+    """
+    nrows, ncols = data2d.shape
+    d = data2d.copy().astype(np.float32)
+    d[np.isnan(d)] = nodata
+    image_bytes = d.tobytes()
+    image_size  = len(image_bytes)
+
+    image_offset    = 8
+    pix_scale       = struct.pack('<3d', cell_deg, cell_deg, 0.0)
+    tiepoint        = struct.pack('<6d', 0.0, 0.0, 0.0, west, north, 0.0)
+    geokeys = struct.pack('<16H',
+        1, 1, 0, 3,
+        1024, 0, 1, 2,     # GTModelTypeGeoKey = Geographic
+        1025, 0, 1, 1,     # GTRasterTypeGeoKey = PixelIsArea
+        2048, 0, 1, 4326,  # GeographicTypeGeoKey = WGS84
+    )
+    nodata_str = f'{nodata:g}\x00'.encode('ascii')
+
+    pix_scale_offset = image_offset + image_size
+    tiepoint_offset  = pix_scale_offset + len(pix_scale)
+    geokeys_offset   = tiepoint_offset  + len(tiepoint)
+    nodata_offset    = geokeys_offset   + len(geokeys)
+    ifd_offset       = nodata_offset    + len(nodata_str)
+
+    SHORT=3; LONG=4; DOUBLE=12; ASCII=2
+    def entry(tag, typ, count, val):
+        return struct.pack('<HHII', tag, typ, count, val)
+
+    entries = sorted([
+        entry(256,   SHORT,  1,               ncols),
+        entry(257,   SHORT,  1,               nrows),
+        entry(258,   SHORT,  1,               32),
+        entry(259,   SHORT,  1,               1),
+        entry(262,   SHORT,  1,               1),
+        entry(273,   LONG,   1,               image_offset),
+        entry(278,   LONG,   1,               nrows),
+        entry(279,   LONG,   1,               image_size),
+        entry(284,   SHORT,  1,               1),
+        entry(339,   SHORT,  1,               3),          # float
+        entry(33550, DOUBLE, 3,               pix_scale_offset),
+        entry(33922, DOUBLE, 6,               tiepoint_offset),
+        entry(34735, SHORT,  len(geokeys)//2, geokeys_offset),
+        entry(42113, ASCII,  len(nodata_str), nodata_offset),
+    ], key=lambda e: struct.unpack('<H', e[:2])[0])
+
+    n_entries = len(entries)
+    ifd_bytes = struct.pack('<H', n_entries) + b''.join(entries) + struct.pack('<I', 0)
+
+    buf = io.BytesIO()
+    buf.write(b'II')
+    buf.write(struct.pack('<H', 42))
+    buf.write(struct.pack('<I', ifd_offset))
+    buf.write(image_bytes)
+    buf.write(pix_scale)
+    buf.write(tiepoint)
+    buf.write(geokeys)
+    buf.write(nodata_str)
+    buf.write(ifd_bytes)
+    return buf.getvalue()
+
+
+def snap_to_tc_grid(val, is_lat):
+    """Snap a coordinate to the nearest TC grid cell centre."""
+    if is_lat:
+        idx = round((LAT_MAX - val) / TC_RES)
+        return LAT_MAX - idx * TC_RES
+    else:
+        while val > 180: val -= 360
+        while val < -180: val += 360
+        idx = round((val - LON_MIN) / TC_RES)
+        return LON_MIN + idx * TC_RES
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: echo '<json>' | python3 export_tc_geotiff.py <out_zip>",
+              file=sys.stderr)
+        sys.exit(1)
+
+    out_zip = sys.argv[1]
+    payload = json.loads(sys.stdin.read())
+
+    mode      = payload['mode']           # 'point' or 'bbox'
+    variables = payload['variables']      # {ppt:{annual:[...]}, aet:{...}, q:{...}}
+
+    # ── Determine grid extent ────────────────────────────────────────────────
+    if mode == 'point':
+        # Single TC pixel: snap to grid centre
+        lat_c = snap_to_tc_grid(payload['lat'], is_lat=True)
+        lon_c = snap_to_tc_grid(payload['lon'], is_lat=False)
+        west  = lon_c - TC_RES / 2
+        north = lat_c + TC_RES / 2
+        nrows, ncols = 1, 1
+        bbox_label = f'{abs(lat_c):.4f}{"N" if lat_c>=0 else "S"}_{abs(lon_c):.4f}{"E" if lon_c>=0 else "W"}'
+        loc_desc = f'Point: {lat_c:.4f}°{"N" if lat_c>=0 else "S"}, {lon_c:.4f}°{"E" if lon_c>=0 else "W"}'
+    else:
+        # Bbox: fill grid with mean value
+        bb = payload['bbox']
+        min_lat, max_lat = bb['minLat'], bb['maxLat']
+        min_lon, max_lon = bb['minLon'], bb['maxLon']
+
+        # Snap edges to TC grid
+        lat_top  = snap_to_tc_grid(max_lat, is_lat=True)   # northernmost centre
+        lat_bot  = snap_to_tc_grid(min_lat, is_lat=True)   # southernmost centre
+        lon_left = snap_to_tc_grid(min_lon, is_lat=False)
+        lon_right= snap_to_tc_grid(max_lon, is_lat=False)
+
+        west  = lon_left  - TC_RES / 2
+        north = lat_top   + TC_RES / 2
+        nrows = round((lat_top - lat_bot)  / TC_RES) + 1
+        ncols = round((lon_right - lon_left) / TC_RES) + 1
+        nrows = max(1, nrows)
+        ncols = max(1, ncols)
+
+        def fmt_lat(v): return f'{abs(v):.1f}{"N" if v>=0 else "S"}'
+        def fmt_lon(v): return f'{abs(v):.1f}{"E" if v>=0 else "W"}'
+        bbox_label = f'{fmt_lat(min_lat)}-{fmt_lat(max_lat)}_{fmt_lon(min_lon)}-{fmt_lon(max_lon)}'
+        loc_desc = f'Bbox mean: {min_lat}°–{max_lat}° lat, {min_lon}°–{max_lon}° lon'
+
+    cell_deg = TC_RES
+
+    # ── Collect all years present across all variables ───────────────────────
+    all_years = set()
+    for vdata in variables.values():
+        for rec in vdata.get('annual', []):
+            if rec.get('value') is not None:
+                all_years.add(int(rec['year']))
+    unique_years = sorted(all_years)
+
+    if not unique_years:
+        print("No valid annual data found", file=sys.stderr)
+        sys.exit(2)
+
+    # Build year→value lookup per variable
+    var_annual = {}
+    for vname, vdata in variables.items():
+        var_annual[vname] = {int(r['year']): r['value']
+                             for r in vdata.get('annual', [])
+                             if r.get('value') is not None}
+
+    # ── Write zip ────────────────────────────────────────────────────────────
+    total_files = 0
+    with zipfile.ZipFile(out_zip, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+        for vname in ['ppt', 'aet', 'q']:
+            if vname not in var_annual:
+                continue
+            meta = VAR_META.get(vname, {'long_name': vname, 'units': 'mm'})
+
+            for yr in unique_years:
+                val = var_annual[vname].get(yr)
+                if val is None:
+                    continue
+
+                # Fill grid: all pixels = the annual value (or spatial mean for bbox)
+                grid = np.full((nrows, ncols), val, dtype=np.float32)
+                tif_bytes = write_geotiff(grid, west, north, cell_deg, nodata=-9999.0)
+
+                fname = f'TC_{vname.upper()}_{yr}_{bbox_label}.tif'
+                zf.writestr(fname, tif_bytes)
+                total_files += 1
+
+        # README
+        readme_lines = [
+            'TerraClimate Annual GeoTIFFs',
+            '============================',
+            'Source:     TerraClimate (Abatzoglou et al. 2018), THREDDS OPeNDAP',
+            f'Variables:  ppt = Precipitation (mm/yr)',
+            f'            aet = Actual Evapotranspiration (mm/yr)',
+            f'            q   = Runoff (mm/yr)',
+            f'CRS:        WGS84 (EPSG:4326)',
+            f'Pixel size: {TC_RES:.6f}° (~4.6 km)',
+            f'Location:   {loc_desc}',
+        ]
+        if mode == 'bbox':
+            readme_lines += [
+                '',
+                'Note: Each pixel in a bbox GeoTIFF holds the spatial mean',
+                'over all TC grid cells within the drawn rectangle.',
+                'This matches the values shown in the app charts.',
+                'For per-pixel spatial data, query individual points.',
+            ]
+        readme_lines += [
+            '',
+            f'NoData:     -9999.0',
+            f'Years:      {min(unique_years)}–{max(unique_years)}',
+            '',
+            'Files: TC_<VAR>_<year>_<location>.tif',
+            '',
+            'Generated by GRACE-TC-Geology Explorer',
+        ]
+        zf.writestr('README.txt', '\n'.join(readme_lines))
+
+    print(f'OK:{out_zip}:{len(unique_years)} years:{total_files} files:{nrows}x{ncols} pixels')
+
+
+if __name__ == '__main__':
+    main()
