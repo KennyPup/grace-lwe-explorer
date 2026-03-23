@@ -224,3 +224,56 @@ export function queryBBox(minLat: number, maxLat: number, minLon: number, maxLon
     annual: buildAnnual(monthly),
   };
 }
+
+/**
+ * Extract raw per-pixel per-timestep LWE values for a bbox.
+ * Returns a compact object suitable for passing to export_geotiff.py via stdin.
+ * This keeps all heavy data in Node (already loaded) so the Python subprocess
+ * never needs to read the 251 MB binary — avoiding double memory usage.
+ */
+export function exportBBoxData(minLat: number, maxLat: number, minLon: number, maxLon: number) {
+  if (!loaded || !lweBuffer) return null;
+
+  const normMinLon = minLon < 0 ? minLon + 360 : minLon;
+  const normMaxLon = maxLon < 0 ? maxLon + 360 : maxLon;
+
+  const latIdxs: number[] = [];
+  const lonIdxs: number[] = [];
+  for (let i = 0; i < nLat; i++) {
+    if (lats[i] >= minLat && lats[i] <= maxLat) latIdxs.push(i);
+  }
+  for (let i = 0; i < nLon; i++) {
+    if (normMinLon <= normMaxLon) {
+      if (lons[i] >= normMinLon && lons[i] <= normMaxLon) lonIdxs.push(i);
+    } else {
+      if (lons[i] >= normMinLon || lons[i] <= normMaxLon) lonIdxs.push(i);
+    }
+  }
+
+  if (latIdxs.length === 0 || lonIdxs.length === 0) return null;
+
+  // Extract pixel values: shape [nTime][nLat_subset][nLon_subset]
+  // Store as flat array to keep JSON compact
+  const nT = nTime;
+  const nR = latIdxs.length;
+  const nC = lonIdxs.length;
+  const values: number[] = new Array(nT * nR * nC);
+  for (let ti = 0; ti < nT; ti++) {
+    for (let ri = 0; ri < nR; ri++) {
+      for (let ci = 0; ci < nC; ci++) {
+        const v = getLWE(ti, latIdxs[ri], lonIdxs[ci]);
+        values[ti * nR * nC + ri * nC + ci] = isValidLWE(v) ? v : -99999;
+      }
+    }
+  }
+
+  return {
+    lats:     latIdxs.map(i => lats[i]),
+    lons:     lonIdxs.map(i => lons[i] > 180 ? lons[i] - 360 : lons[i]),
+    times,
+    nT, nR, nC,
+    fillValue: -99999,
+    values,   // flat float array [nT * nR * nC]
+    minLat, maxLat, minLon, maxLon,
+  };
+}

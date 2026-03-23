@@ -1,6 +1,6 @@
 import type { Express } from "express";
 import type { Server } from "http";
-import { loadGraceData, getStatus, queryPoint, queryBBox } from "./grace";
+import { loadGraceData, getStatus, queryPoint, queryBBox, exportBBoxData } from "./grace";
 import { queryTerraClimatePoint, queryTerraClimateBBox } from "./terraclimate";
 import { getGeologySummary } from "./geology";
 import { execFile } from "child_process";
@@ -87,8 +87,10 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
   });
 
-  // GeoTIFF export: generates annual mean GeoTIFFs for a bbox, returns a zip
-  // ?minLat=35&maxLat=40&minLon=-120&maxLon=-115  (or omit for global)
+  // GeoTIFF export: generates annual mean GeoTIFFs for a bbox, returns a zip.
+  // Node extracts just the needed pixels from the already-loaded buffer and
+  // pipes them as JSON to Python via stdin — Python never reads the 251MB binary,
+  // preventing double memory usage that caused OOM on Render's free tier.
   app.get("/api/export/geotiff", (req, res) => {
     const { loaded, loadError } = getStatus();
     if (!loaded) {
@@ -105,33 +107,32 @@ export function registerRoutes(httpServer: Server, app: Express) {
       return res.status(400).json({ error: "Invalid bbox parameters" });
     }
 
-    const DATA_DIR  = path.join(process.cwd(), "data");
-    const binFile   = path.join(DATA_DIR, "grace_lwe.bin");
-    const metaFile  = path.join(DATA_DIR, "grace_meta.json");
+    // Extract only the needed pixels in Node (data already in memory)
+    const exportData = exportBBoxData(minLat, maxLat, minLon, maxLon);
+    if (!exportData) {
+      return res.status(400).json({ error: "No GRACE pixels found in bounding box" });
+    }
+
     const scriptFile = path.join(process.cwd(), "server", "export_geotiff.py");
-    // For production (compiled), script ships alongside the server
     const scriptAlt  = path.join(path.dirname(process.argv[1] || ""), "export_geotiff.py");
     const script = fs.existsSync(scriptFile) ? scriptFile : scriptAlt;
-
     const outZip = path.join(os.tmpdir(), `grace_lwe_${Date.now()}.zip`);
 
-    const args = [
-      script,
-      binFile,
-      metaFile,
-      String(minLat),
-      String(maxLat),
-      String(minLon),
-      String(maxLon),
-      outZip,
-    ];
+    console.log(`[GeoTIFF] Exporting bbox ${minLat},${maxLat},${minLon},${maxLon} — ${exportData.nR}x${exportData.nC} pixels, ${exportData.nT} timesteps`);
 
-    console.log(`[GeoTIFF] Exporting bbox ${minLat},${maxLat},${minLon},${maxLon}`);
+    // Spawn Python, pipe the extracted data as JSON via stdin
+    const { spawn } = require("child_process");
+    const py = spawn("python3", [script, outZip], { timeout: 60000 });
 
-    execFile("python3", args, { timeout: 60000 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error("[GeoTIFF] Error:", stderr || err.message);
-        return res.status(500).json({ error: "GeoTIFF export failed: " + (stderr || err.message) });
+    let stdout = "";
+    let stderr = "";
+    py.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    py.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+    py.on("close", (code: number) => {
+      if (code !== 0) {
+        console.error("[GeoTIFF] Python error:", stderr);
+        return res.status(500).json({ error: "GeoTIFF export failed: " + (stderr.slice(0, 300) || `exit ${code}`) });
       }
 
       const line = stdout.trim();
@@ -139,32 +140,25 @@ export function registerRoutes(httpServer: Server, app: Express) {
         return res.status(500).json({ error: "Export script error: " + line });
       }
 
-      // Parse: OK:<zip>:<N years>:<AxB pixels>
       const parts = line.split(":");
-      const nYears = parts[2] || "?";
-      const dims   = parts[3] || "?";
-      console.log(`[GeoTIFF] Done — ${nYears} years, ${dims} pixels → ${outZip}`);
+      console.log(`[GeoTIFF] Done — ${parts[2]} years, ${parts[3]} pixels`);
 
-      // Build a descriptive filename for the download
       const latLabel = `${Math.abs(minLat).toFixed(1)}${minLat>=0?"N":"S"}-${Math.abs(maxLat).toFixed(1)}${maxLat>=0?"N":"S"}`;
       const lonLabel = `${Math.abs(minLon).toFixed(1)}${minLon>=0?"E":"W"}-${Math.abs(maxLon).toFixed(1)}${maxLon>=0?"E":"W"}`;
       const dlName   = `GRACE_LWE_${latLabel}_${lonLabel}.zip`;
 
       res.setHeader("Content-Type", "application/zip");
       res.setHeader("Content-Disposition", `attachment; filename="${dlName}"`);
-      res.setHeader("X-Grace-Years", nYears);
-      res.setHeader("X-Grace-Dims",  dims);
 
       const stream = fs.createReadStream(outZip);
       stream.pipe(res);
-      stream.on("end", () => {
-        fs.unlink(outZip, () => {}); // cleanup temp file
-      });
-      stream.on("error", (e) => {
-        console.error("[GeoTIFF] Stream error:", e);
-        res.destroy();
-      });
+      stream.on("end", () => { fs.unlink(outZip, () => {}); });
+      stream.on("error", (e: Error) => { console.error("[GeoTIFF] Stream error:", e); res.destroy(); });
     });
+
+    // Write extracted pixel data as JSON to Python's stdin, then close
+    py.stdin.write(JSON.stringify(exportData));
+    py.stdin.end();
   });
 
   // TerraClimate bbox query: ?minLat=35&maxLat=40&minLon=-120&maxLon=-115
