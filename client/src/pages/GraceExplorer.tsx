@@ -43,7 +43,7 @@ interface TCResult {
 const GRACE_PANEL_W = 380;
 const TC_PANEL_W = 320;
 const HDR_H = 56;
-const GEO_H = 88; // bottom geology strip height
+const GEO_H = 0; // geology moved into GRACE panel — no bottom strip
 
 const MONTH_LABELS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
@@ -149,8 +149,10 @@ export default function GraceExplorer() {
   useEffect(() => {
     if (!pendingQuery || !status?.loaded) return;
     runQuery(pendingQuery);
-    runTCQuery(pendingQuery);
     runGeoQuery(pendingQuery);
+    // TC data is NOT auto-fetched — user clicks the button in the TC panel
+    setTcResult(null);
+    setTcError(null);
   }, [pendingQuery, status?.loaded]);
 
   // Draw tile grid on map + persistent AOI outline
@@ -785,6 +787,14 @@ export default function GraceExplorer() {
         const bf = baseflowMeans[i] !== null ? baseflowMeans[i]!.toFixed(1) : "";
         return `${lbl},${p},${a},${r},${bf}`;
       });
+      // Append annual mean row (mean of 12 monthly means)
+      const annMeanP  = mmPpt.every(v => v !== null) ? (mmPpt as number[]).reduce((a,b)=>a+b,0)/12 : null;
+      const annMeanA  = mmAet.every(v => v !== null) ? (mmAet as number[]).reduce((a,b)=>a+b,0)/12 : null;
+      const annMeanR  = mmRo.every(v  => v !== null) ? (mmRo  as number[]).reduce((a,b)=>a+b,0)/12 : null;
+      const annMeanBf = baseflowMeans.every(v => v !== null) ? (baseflowMeans as number[]).reduce((a,b)=>a+b,0)/12 : null;
+      dataRows.push(
+        `Annual Mean,${annMeanP?.toFixed(1)??''},${annMeanA?.toFixed(1)??''},${annMeanR?.toFixed(1)??''},${annMeanBf?.toFixed(1)??''}`
+      );
     } else {
       const annualPpt = tcResult.variables.ppt.annual;
       const annualAet = tcResult.variables.aet.annual;
@@ -1210,7 +1220,7 @@ export default function GraceExplorer() {
             </div>
           </div>
 
-          {/* Empty state */}
+          {/* Empty state / Calculate button */}
           {!tcResult && !tcLoading && !tcError && (
             <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "20px 16px", textAlign: "center" }}>
               <svg viewBox="0 0 64 64" width="40" height="40" fill="none" style={{ opacity: 0.15, marginBottom: 12 }}>
@@ -1218,11 +1228,32 @@ export default function GraceExplorer() {
                 <path d="M20 34c0-6.63 5.37-12 12-12s12 5.37 12 12" stroke="#e6edf3" strokeWidth="2" strokeLinecap="round"/>
                 <path d="M12 42c5 5 10 8 20 8s15-3 20-8" stroke="#e6edf3" strokeWidth="2" strokeLinecap="round"/>
               </svg>
-              <div style={{ fontSize: "11px", color: "#6e7681", lineHeight: 1.8 }}>
-                {isReady
-                  ? <>Select a <span style={{ color: "#22d3ee" }}>point</span> or <span style={{ color: "#f59e0b" }}>region</span> on the map to load climate data<br/><span style={{ fontSize: "10px", color: "#484f58", marginTop: 4, display: "block" }}>Precip · Actual ET · Runoff</span></>
-                  : "Loading…"}
-              </div>
+              {pendingQuery ? (
+                <>
+                  <div style={{ fontSize: "11px", color: "#8b949e", lineHeight: 1.8, marginBottom: 14 }}>
+                    AOI selected — ready to fetch climate data
+                  </div>
+                  <button
+                    onClick={() => runTCQuery(pendingQuery!)}
+                    style={{
+                      padding: "8px 18px", fontSize: "12px", fontWeight: 700,
+                      background: "#0c2340", border: "1.5px solid #60a5fa",
+                      borderRadius: 7, color: "#60a5fa", cursor: "pointer",
+                      letterSpacing: "0.03em",
+                    }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "#1a3a5c"; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "#0c2340"; }}
+                  >
+                    Calculate TC Data
+                  </button>
+                </>
+              ) : (
+                <div style={{ fontSize: "11px", color: "#6e7681", lineHeight: 1.8 }}>
+                  {isReady
+                    ? <>Select a <span style={{ color: "#22d3ee" }}>point</span> or <span style={{ color: "#f59e0b" }}>region</span> on the map,<br/>then click <strong style={{ color: "#60a5fa" }}>Calculate TC Data</strong><br/><span style={{ fontSize: "10px", color: "#484f58", marginTop: 4, display: "block" }}>Precip · Actual ET · Runoff · Baseflow</span></>
+                    : "Loading…"}
+                </div>
+              )}
             </div>
           )}
 
@@ -1247,9 +1278,24 @@ export default function GraceExplorer() {
           {/* TC Results */}
           {tcResult && !tcLoading && (
             <>
-              {/* Location label */}
-              <div style={{ padding: "8px 12px 6px", borderBottom: "1px solid #21262d", flexShrink: 0 }}>
-                <div style={{ fontSize: "10px", color: "#8b949e", marginBottom: 1 }}>{locationName}</div>
+              {/* Location label + recalculate */}
+              <div style={{ padding: "6px 12px", borderBottom: "1px solid #21262d", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ fontSize: "10px", color: "#8b949e" }}>{locationName}</div>
+                {pendingQuery && (
+                  <button
+                    onClick={() => runTCQuery(pendingQuery!)}
+                    title="Re-fetch TC data for current AOI"
+                    style={{
+                      padding: "2px 8px", fontSize: "9px", fontWeight: 600,
+                      background: "transparent", border: "1px solid #30363d",
+                      borderRadius: 4, color: "#484f58", cursor: "pointer",
+                    }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.borderColor = "#60a5fa"; (e.currentTarget as HTMLButtonElement).style.color = "#60a5fa"; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.borderColor = "#30363d"; (e.currentTarget as HTMLButtonElement).style.color = "#484f58"; }}
+                  >
+                    Recalculate
+                  </button>
+                )}
               </div>
 
               {/* Mode toggle + CSV + GeoTIFF */}
@@ -1370,6 +1416,7 @@ export default function GraceExplorer() {
           )}
 
           <div style={{ marginTop: "auto", padding: "6px 12px", borderTop: "1px solid #30363d" }}>
+            <div style={{ fontSize: "9px", color: "#484f58", marginBottom: 3 }}>Designed by Ken Hardcastle, 2026</div>
             <PerplexityAttribution />
           </div>
         </div>
@@ -1625,86 +1672,49 @@ export default function GraceExplorer() {
                   </div>
                 </div>
 
-                {/* Annual table */}
-                <div style={{ padding: "12px 14px 8px", borderTop: "1px solid #30363d" }}>
-                  <div style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>
-                    {isBboxResult ? "Spatial Mean LWE by Year" : "Annual Mean LWE by Year"}
-                  </div>
-                  <div style={{ overflowY: "auto", maxHeight: 260 }}>
-                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                      <thead>
-                        <tr style={{ borderBottom: "1px solid #30363d" }}>
-                          {["Year", "LWE (cm)", ""].map((h, i) => (
-                            <th key={i} style={{ padding: "4px 6px", textAlign: i === 0 ? "left" : "right", fontSize: 10, color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 500 }}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {queryResult.annual.map((row) => {
-                          const v = row.lwe ?? 0;
-                          const pct = maxAbs > 0 ? Math.abs(v) / maxAbs : 0;
-                          const isPos = v >= 0;
-                          return (
-                            <tr key={row.year} style={{ borderBottom: "1px solid #0d1117" }}>
-                              <td style={{ padding: "5px 6px", fontSize: 12, color: "#e6edf3", fontFamily: "monospace" }}>{row.year}</td>
-                              <td style={{ padding: "5px 6px", textAlign: "right", fontSize: 12, fontWeight: 600, fontFamily: "monospace", color: isPos ? "#22d3ee" : "#f87171" }}>
-                                {isPos ? "+" : ""}{v.toFixed(2)}
-                              </td>
-                              <td style={{ padding: "5px 6px", width: 70 }}>
-                                <div style={{ height: 5, width: `${Math.round(pct * 62)}px`, background: isPos ? "#0e4c5a" : "#5a1a1a", borderRadius: 2, border: `1px solid ${isPos ? "#22d3ee" : "#f87171"}` }}/>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-
-                <div style={{ padding: "6px 14px", borderTop: "1px solid #30363d", fontSize: 10, color: "#6e7681" }}>
+                <div style={{ padding: "6px 14px", borderTop: "1px solid #30363d", fontSize: 10, color: "#6e7681", flexShrink: 0 }}>
                   JPL GRACE/GRACE-FO Mascon RL06.3 CRI · cm LWE anomaly · 0.5° grid
                   {isBboxResult && <> · spatial mean of {queryResult.nGridCells} pixels</>}
+                </div>
+
+                {/* Geology / Hydrogeology — scrollable */}
+                <div style={{ borderTop: "1px solid #30363d", flexShrink: 0 }}>
+                  <div style={{ padding: "8px 14px 4px", display: "flex", alignItems: "center", gap: 7 }}>
+                    <svg viewBox="0 0 16 16" width="13" height="13" fill="none">
+                      <path d="M2 13L6 7l3 4 2-3 3 5H2z" stroke="#a3a3a3" strokeWidth="1.3" strokeLinejoin="round"/>
+                      <circle cx="11" cy="4" r="2" stroke="#a3a3a3" strokeWidth="1.3"/>
+                    </svg>
+                    <span style={{ fontSize: "10px", fontWeight: 700, color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em" }}>Geology &amp; Hydrogeology</span>
+                    {locationName && geoSummary && (
+                      <span style={{ fontSize: "9px", color: "#484f58", marginLeft: "auto" }}>AI · {locationName}</span>
+                    )}
+                  </div>
+                  <div style={{ padding: "4px 14px 14px", fontSize: "12px", color: "#e6edf3", lineHeight: 1.7 }}>
+                    {!geoSummary && !geoLoading && !geoError && (
+                      <span style={{ color: "#484f58", fontSize: "11px" }}>Generating geology summary…</span>
+                    )}
+                    {geoLoading && (
+                      <span style={{ color: "#8b949e", fontSize: "11px" }}>
+                        <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", border: "1.5px solid #30363d", borderTopColor: "#a3a3a3", animation: "spin 0.8s linear infinite", marginRight: 8, verticalAlign: "middle" }}/>
+                        Generating geology summary…
+                      </span>
+                    )}
+                    {geoError && !geoLoading && <span style={{ color: "#f87171", fontSize: "11px" }}>{geoError}</span>}
+                    {geoSummary && !geoLoading && <span>{geoSummary}</span>}
+                  </div>
                 </div>
               </>
             );
           })()}
 
           <div style={{ marginTop: "auto", padding: "8px 14px", borderTop: "1px solid #30363d" }}>
+            <div style={{ fontSize: "9px", color: "#484f58", marginBottom: 3 }}>Designed by Ken Hardcastle, 2026</div>
             <PerplexityAttribution />
           </div>
         </div>
       </div>
 
-      {/* ── BOTTOM: GEOLOGY ── */}
-      <div style={{
-        position: "absolute", bottom: 0, left: 0, right: 0, height: GEO_H,
-        background: "#161b22", borderTop: "1px solid #30363d",
-        display: "flex", alignItems: "center", gap: 16, padding: "0 20px", zIndex: 5,
-      }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-          <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
-            <path d="M2 13L6 7l3 4 2-3 3 5H2z" stroke="#a3a3a3" strokeWidth="1.3" strokeLinejoin="round"/>
-            <circle cx="11" cy="4" r="2" stroke="#a3a3a3" strokeWidth="1.3"/>
-          </svg>
-          <span style={{ fontSize: "10px", fontWeight: 700, color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em" }}>Geology</span>
-        </div>
-        <div style={{ flex: 1, fontSize: "12px", color: "#e6edf3", lineHeight: 1.6 }}>
-          {!geoSummary && !geoLoading && !geoError && (
-            <span style={{ color: "#484f58", fontSize: "11px" }}>Select a point or region to see a geology &amp; hydrogeology summary</span>
-          )}
-          {geoLoading && (
-            <span style={{ color: "#8b949e", fontSize: "11px" }}>
-              <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", border: "1.5px solid #30363d", borderTopColor: "#a3a3a3", animation: "spin 0.8s linear infinite", marginRight: 8, verticalAlign: "middle" }}/>
-              Generating geology summary…
-            </span>
-          )}
-          {geoError && !geoLoading && <span style={{ color: "#f87171", fontSize: "11px" }}>{geoError}</span>}
-          {geoSummary && !geoLoading && <span>{geoSummary}</span>}
-        </div>
-        {locationName && geoSummary && (
-          <div style={{ fontSize: "10px", color: "#484f58", flexShrink: 0 }}>AI-generated · {locationName}</div>
-        )}
-      </div>
+      {/* Bottom geology strip removed — content moved into GRACE panel */}
     </>
   );
 }
