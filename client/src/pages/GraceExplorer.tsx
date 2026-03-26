@@ -109,6 +109,14 @@ export default function GraceExplorer() {
   const graceRasterOpacityRef = useRef(0.7);
   useEffect(() => { graceRasterOpacityRef.current = graceRasterOpacity; }, [graceRasterOpacity]);
 
+  // Cache for raw grid data per year — so AOI stretch doesn't require a refetch
+  type GraceGrid = { values: number[]; nLat: number; nLon: number; vmin: number; vmax: number };
+  const graceGridCacheRef = useRef<Record<number, GraceGrid>>({});
+  // Current AOI bounds for local color stretch — updated whenever a query result arrives
+  const graceAoiRef = useRef<{ minLat: number; maxLat: number; minLon: number; maxLon: number } | null>(null);
+  // Legend state — shown min/max for the active stretch
+  const [graceLegendRange, setGraceLegendRange] = useState<{ lo: number; hi: number } | null>(null);
+
   // Geologic map overlay
   const [geoOpacity, setGeoOpacity] = useState(0);
   const macroLayerRef = useRef<L.TileLayer | null>(null);
@@ -166,9 +174,9 @@ export default function GraceExplorer() {
   useEffect(() => {
     if (!status?.loaded) return;
     renderGraceRaster(graceRasterYear, graceRasterOpacity);
-  }, [status?.loaded, graceRasterYear]);
+  }, [status?.loaded, graceRasterYear]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Update opacity without re-fetching
+  // Update opacity without re-rendering canvas
   useEffect(() => {
     if (graceImageOverlayRef.current) {
       graceImageOverlayRef.current.setOpacity(graceRasterOpacity);
@@ -206,21 +214,64 @@ export default function GraceExplorer() {
   }, []);
 
   // ── GRACE raster renderer ─────────────────────────────────────────────────
-  // Fetches annual mean grid from backend, renders to a canvas, and places it
-  // as a Leaflet ImageOverlay covering the full globe.
+  // Fetches/caches the annual mean grid from backend, then paints a canvas with
+  // a diverging blue→white→red color scale stretched to the AOI if one is set,
+  // or to the global min/max otherwise.  Places result as a Leaflet ImageOverlay.
+  //
+  // Color stretch logic:
+  //   - If graceAoiRef.current is set: compute vmin/vmax from pixels inside the bbox
+  //   - Otherwise: use global vmin/vmax from the full grid
+  //   - The scale is symmetric around 0: absMax = max(|vmin|, |vmax|)
+  //   - Pixels outside the scale clamp at -1/+1 (full blue/red)
   const renderGraceRaster = useCallback(async (year: number, opacity: number) => {
     if (!leafletMap.current) return;
     const API_BASE_R = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
     try {
-      const resp = await fetch(`${API_BASE_R}/api/grace-raster?year=${year}`);
-      if (!resp.ok) return;
-      const grid = await resp.json();
-      const { values, nLat, nLon, vmin, vmax } = grid as {
-        values: number[]; nLat: number; nLon: number;
-        vmin: number; vmax: number;
-      };
+      // Fetch or use cached grid
+      let grid = graceGridCacheRef.current[year];
+      if (!grid) {
+        const resp = await fetch(`${API_BASE_R}/api/grace-raster?year=${year}`);
+        if (!resp.ok) return;
+        const raw = await resp.json() as { values: number[]; nLat: number; nLon: number; vmin: number; vmax: number };
+        grid = { values: raw.values, nLat: raw.nLat, nLon: raw.nLon, vmin: raw.vmin, vmax: raw.vmax };
+        graceGridCacheRef.current[year] = grid;
+      }
+      const { values, nLat, nLon } = grid;
 
-      // Build canvas
+      // ── Compute local min/max if an AOI is set ────────────────────────────
+      // Grid row 0 = north (+89.75°), col 0 = west (-179.75°), step = 0.5°
+      let absMax: number;
+      const aoi = graceAoiRef.current;
+      if (aoi) {
+        let localMin = Infinity, localMax = -Infinity;
+        for (let row = 0; row < nLat; row++) {
+          // row 0 = 89.75°N, step -0.5°
+          const lat = 89.75 - row * 0.5;
+          if (lat < aoi.minLat - 0.25 || lat > aoi.maxLat + 0.25) continue;
+          for (let col = 0; col < nLon; col++) {
+            // col 0 = -179.75°, step +0.5°
+            const lon = -179.75 + col * 0.5;
+            if (lon < aoi.minLon - 0.25 || lon > aoi.maxLon + 0.25) continue;
+            const v = values[row * nLon + col];
+            if (v === -99999) continue;
+            if (v < localMin) localMin = v;
+            if (v > localMax) localMax = v;
+          }
+        }
+        if (localMin === Infinity) {
+          // No valid pixels in AOI — fall back to global
+          absMax = Math.max(Math.abs(grid.vmin), Math.abs(grid.vmax), 0.01);
+          setGraceLegendRange(null);
+        } else {
+          absMax = Math.max(Math.abs(localMin), Math.abs(localMax), 0.01);
+          setGraceLegendRange({ lo: localMin, hi: localMax });
+        }
+      } else {
+        absMax = Math.max(Math.abs(grid.vmin), Math.abs(grid.vmax), 0.01);
+        setGraceLegendRange(null);
+      }
+
+      // ── Paint canvas ─────────────────────────────────────────────────────
       const canvas = document.createElement('canvas');
       canvas.width = nLon;
       canvas.height = nLat;
@@ -228,23 +279,21 @@ export default function GraceExplorer() {
       const imgData = ctx.createImageData(nLon, nLat);
       const d = imgData.data;
 
-      // Diverging blue→white→red, symmetric around 0
-      const absMax = Math.max(Math.abs(vmin), Math.abs(vmax), 0.01);
       for (let i = 0; i < nLat * nLon; i++) {
         const v = values[i];
-        let r = 30, g = 30, b = 30, a = 0;
+        let r = 0, g = 0, b = 0, a = 0;
         if (v !== -99999) {
           const t = Math.max(-1, Math.min(1, v / absMax)); // -1 to +1
           if (t < 0) {
-            // negative: blue (0,100,200) → white
-            const s = -t; // 0..1 strength
-            r = Math.round(255 - s * (255 - 0));
-            g = Math.round(255 - s * (255 - 100));
-            b = Math.round(255 - s * (255 - 220));
+            // Negative LWE: blue (0,100,220) → white
+            const s = -t;
+            r = Math.round(255 - s * 255);
+            g = Math.round(255 - s * 155);
+            b = 220 + Math.round((1 - s) * 35); // 220→255 as s→1
           } else {
-            // positive: white → red (220,40,40)
+            // Positive LWE: white → red (220,40,40)
             const s = t;
-            r = Math.round(255 - s * (255 - 220));
+            r = Math.round(255 - s * 35);
             g = Math.round(255 - s * 215);
             b = Math.round(255 - s * 215);
           }
@@ -256,12 +305,9 @@ export default function GraceExplorer() {
       ctx.putImageData(imgData, 0, 0);
       const dataUrl = canvas.toDataURL('image/png');
 
-      // Place as Leaflet ImageOverlay covering full globe
-      const bounds: L.LatLngBoundsExpression = [[-90, -180], [90, 180]];
-      if (graceImageOverlayRef.current) {
-        graceImageOverlayRef.current.remove();
-      }
-      const overlay = L.imageOverlay(dataUrl, bounds, {
+      // ── Place as Leaflet ImageOverlay covering full globe ─────────────────
+      if (graceImageOverlayRef.current) graceImageOverlayRef.current.remove();
+      const overlay = L.imageOverlay(dataUrl, [[-90, -180], [90, 180]], {
         opacity,
         zIndex: 195,
         interactive: false,
@@ -272,14 +318,11 @@ export default function GraceExplorer() {
     } catch (e) {
       console.error('[GRACE Raster]', e);
     }
-  }, []);
+  }, []); // graceAoiRef & graceGridCacheRef are refs — stable references
 
-  // Fetch raster on mount (once GRACE data ready) and when year changes
-  const { data: rasterStatus } = useQuery<{ loaded: boolean }>({
-    queryKey: ["/api/status"],
-    select: (d: any) => ({ loaded: d.loaded }),
-    refetchInterval: false,
-  });
+  // Expose a ref-stable re-render function so runQuery can call it after AOI update
+  const renderGraceRasterRef = useRef(renderGraceRaster);
+  useEffect(() => { renderGraceRasterRef.current = renderGraceRaster; }, [renderGraceRaster]);
 
   // Convert raw fetch/HTTP errors into user-friendly messages
   function friendlyError(e: any): string {
@@ -311,12 +354,28 @@ export default function GraceExplorer() {
       // Pass original coords so TC AOI box lands on the actual click, not the GRACE-snapped cell
       const orig = q.type === "point" ? { lat: q.params.lat, lon: q.params.lon } : undefined;
       drawTiles(data, orig);
+
+      // ── Update GRACE AOI for local color stretch ─────────────────────────────
+      // For a region bbox use it directly; for a point use the GRACE-snapped cell ±0.25°
+      if (data.bbox) {
+        graceAoiRef.current = {
+          minLat: data.bbox.minLat, maxLat: data.bbox.maxLat,
+          minLon: data.bbox.minLon, maxLon: data.bbox.maxLon,
+        };
+      } else if (data.lat !== undefined && data.lon !== undefined) {
+        graceAoiRef.current = {
+          minLat: data.lat - 0.25, maxLat: data.lat + 0.25,
+          minLon: data.lon - 0.25, maxLon: data.lon + 0.25,
+        };
+      }
+      // Re-paint raster with the new local stretch (grid is cached, no re-fetch)
+      renderGraceRasterRef.current(graceRasterYear, graceRasterOpacityRef.current);
     } catch (e: any) {
       setQueryError(friendlyError(e));
     } finally {
       setQueryLoading(false);
     }
-  }, [drawTiles]);
+  }, [drawTiles, graceRasterYear]);
 
   const runTCQuery = useCallback(async (q: { type: "point" | "bbox"; params: Record<string, number> }) => {
     setTcLoading(true);
@@ -1207,17 +1266,26 @@ export default function GraceExplorer() {
             <span style={{ fontSize: "10px", color: graceRasterOpacity > 0 ? "#f59e0b" : "#484f58", fontFamily: "monospace", width: 28, textAlign: "right" }}>
               {graceRasterOpacity > 0 ? `${Math.round(graceRasterOpacity * 100)}%` : "off"}
             </span>
-            {/* Compact diverging color legend: blue=negative, white=0, red=positive */}
+            {/* Diverging color legend — shows AOI-local range when available */}
             <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, marginLeft: 2 }}>
+              {/* Left label: min or −LWE */}
+              <span style={{ fontSize: "8px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1, textAlign: "right", minWidth: 28 }}>
+                {graceLegendRange ? `${graceLegendRange.lo.toFixed(1)}` : "−"}
+              </span>
+              {/* Gradient bar */}
               <div style={{
-                width: 48, height: 10, borderRadius: 3,
+                width: 52, height: 10, borderRadius: 3, flexShrink: 0,
                 background: "linear-gradient(to right, rgb(0,100,220), rgb(255,255,255), rgb(220,40,40))",
-                border: "1px solid #30363d",
+                border: `1px solid ${graceLegendRange ? "#f59e0b80" : "#30363d"}`,
+                boxShadow: graceLegendRange ? "0 0 4px #f59e0b40" : "none",
               }}/>
-              <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
-                <span style={{ fontSize: "8px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1 }}>−LWE</span>
-                <span style={{ fontSize: "8px", color: "#f87171", fontFamily: "monospace", lineHeight: 1 }}>+LWE</span>
-              </div>
+              {/* Right label: max or +LWE */}
+              <span style={{ fontSize: "8px", color: "#f87171", fontFamily: "monospace", lineHeight: 1, minWidth: 28 }}>
+                {graceLegendRange ? `${graceLegendRange.hi.toFixed(1)}` : "+"}
+              </span>
+              {graceLegendRange && (
+                <span style={{ fontSize: "7px", color: "#f59e0b", fontFamily: "monospace", lineHeight: 1 }}>AOI</span>
+              )}
             </div>
           </div>
 
