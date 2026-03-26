@@ -254,9 +254,11 @@ export default function GraceExplorer() {
       const { values, nLat, nLon } = grid;
 
       // ── visParams: symmetric ±absMax (same scale as bar chart Y-axis) ────────
-      // min = -absMax → full blue (#0000ff)
-      // 0            → white   (#ffffff)
-      // max = +absMax → full red  (#ff0000)
+      // GRACE LWE convention: Positive = water GAIN = BLUE
+      //                       Negative = water LOSS = RED
+      // min = -absMax → full red  (#ff0000)  [max loss]
+      // 0            → white     (#ffffff)   [baseline]
+      // max = +absMax → full blue (#0000ff)  [max gain]
       const vp = graceVisParamsRef.current;
       const absMax = vp ? vp.absMax : Math.max(Math.abs(grid.vmin), Math.abs(grid.vmax), 0.01);
 
@@ -293,16 +295,17 @@ export default function GraceExplorer() {
             d[px] = 0; d[px+1] = 0; d[px+2] = 0; d[px+3] = 0; // transparent
             continue;
           }
-          // Symmetric scale: -absMax→blue(0,0,255)  0→white(255,255,255)  +absMax→red(255,0,0)
+          // Symmetric scale: -absMax→red(255,0,0)  0→white(255,255,255)  +absMax→blue(0,0,255)
+          // Positive LWE = water Gain = Blue; Negative LWE = water Loss = Red
           const s = Math.min(1, Math.abs(v) / absMax); // normalised intensity [0,1]
           let r: number, g: number, b: number;
-          if (v <= 0) {
-            // Negative → interpolate white→blue
+          if (v >= 0) {
+            // Positive (Gain) → white→blue
             r = Math.round(255 * (1 - s));
             g = Math.round(255 * (1 - s));
             b = 255;
           } else {
-            // Positive → interpolate white→red
+            // Negative (Loss) → white→red
             r = 255;
             g = Math.round(255 * (1 - s));
             b = Math.round(255 * (1 - s));
@@ -1042,19 +1045,20 @@ export default function GraceExplorer() {
   const maxAbs = chartData.reduce((m, d) => Math.max(m, Math.abs(d.value ?? 0)), 0);
 
   // barColor: exact same symmetric scale as raster
-  // -absMax→blue(0,0,255)  0→white(255,255,255)  +absMax→red(255,0,0)
+  // GRACE LWE: Positive = Gain = Blue; Negative = Loss = Red
+  // -absMax→red(255,0,0)  0→white(255,255,255)  +absMax→blue(0,0,255)
   const chartAbsMax = graceChartAbsMaxRef.current || maxAbs || 0.01;
   const barColor = (v: number | null): string => {
     if (v === null) return "#444";
     const s = Math.min(1, Math.abs(v) / chartAbsMax);
     if (v >= 0) {
-      // positive → white→red
-      const c = Math.round(255 * (1 - s));
-      return `rgb(255,${c},${c})`;
-    } else {
-      // negative → white→blue
+      // positive (Gain) → white→blue
       const c = Math.round(255 * (1 - s));
       return `rgb(${c},${c},255)`;
+    } else {
+      // negative (Loss) → white→red
+      const c = Math.round(255 * (1 - s));
+      return `rgb(255,${c},${c})`;
     }
   };
 
@@ -1317,17 +1321,17 @@ export default function GraceExplorer() {
             <span style={{ fontSize: "10px", color: graceRasterOpacity > 0 ? "#f59e0b" : "#484f58", fontFamily: "monospace", width: 28, textAlign: "right" }}>
               {graceRasterOpacity > 0 ? `${Math.round(graceRasterOpacity * 100)}%` : "off"}
             </span>
-            {/* Diverging color legend — shares the bar-chart scale once an AOI is selected */}
+            {/* Diverging color legend — Red=Loss(left/neg) → White=0 → Blue=Gain(right/pos) */}
             <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, marginLeft: 2 }}>
-              {/* Left label: lo (full blue extreme) */}
-              <span style={{ fontSize: "8px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1, textAlign: "right", minWidth: 30 }}>
+              {/* Left label: lo value (negative = Loss = red side) */}
+              <span style={{ fontSize: "8px", color: "#f87171", fontFamily: "monospace", lineHeight: 1, textAlign: "right", minWidth: 30 }}>
                 {graceLegendRange ? (graceLegendRange.lo < 0 ? `−${Math.abs(graceLegendRange.lo).toFixed(1)}` : graceLegendRange.lo.toFixed(1)) : "−"}
               </span>
-              {/* Gradient bar with tick at center (= 0) */}
+              {/* Gradient bar: red(left/loss) → white(0) → blue(right/gain) */}
               <div style={{ position: "relative", flexShrink: 0 }}>
                 <div style={{
                   width: 52, height: 10, borderRadius: 3,
-                  background: "linear-gradient(to right, rgb(0,100,220), rgb(255,255,255), rgb(220,40,40))",
+                  background: "linear-gradient(to right, rgb(255,0,0), rgb(255,255,255), rgb(0,0,255))",
                   border: `1px solid ${graceLegendRange ? "#f59e0b80" : "#30363d"}`,
                   boxShadow: graceLegendRange ? "0 0 4px #f59e0b40" : "none",
                 }}/>
@@ -1337,8 +1341,8 @@ export default function GraceExplorer() {
                   width: 1, height: 14, background: "#ffffff80", pointerEvents: "none",
                 }}/>
               </div>
-              {/* Right label: hi (full red extreme) */}
-              <span style={{ fontSize: "8px", color: "#f87171", fontFamily: "monospace", lineHeight: 1, minWidth: 30 }}>
+              {/* Right label: hi value (positive = Gain = blue side) */}
+              <span style={{ fontSize: "8px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1, minWidth: 30 }}>
                 {graceLegendRange ? `+${graceLegendRange.hi.toFixed(1)}` : "+"}
               </span>
               {graceLegendRange && (
