@@ -104,9 +104,9 @@ export default function GraceExplorer() {
 
   // GRACE raster overlay
   const [graceRasterYear, setGraceRasterYear] = useState(2024);
-  const [graceRasterOpacity, setGraceRasterOpacity] = useState(0.7);
+  const [graceRasterOpacity, setGraceRasterOpacity] = useState(0);
   const graceImageOverlayRef = useRef<L.ImageOverlay | null>(null);
-  const graceRasterOpacityRef = useRef(0.7);
+  const graceRasterOpacityRef = useRef(0);
   useEffect(() => { graceRasterOpacityRef.current = graceRasterOpacity; }, [graceRasterOpacity]);
 
   // Cache for raw grid data per year — so AOI stretch doesn't require a refetch
@@ -119,8 +119,8 @@ export default function GraceExplorer() {
   // lo  = series min  (maps to full blue)   — can be negative or positive
   // hi  = series max  (maps to full red)    — can be negative or positive
   // White point is always fixed at 0.
-  const graceChartAbsMaxRef = useRef<number>(0); // kept for bar barColor (uses max of |lo|,|hi|)
-  const graceVisParamsRef = useRef<{ lo: number; hi: number } | null>(null);
+  const graceChartAbsMaxRef = useRef<number>(0); // symmetric absMax: max(|min|,|max|) — shared by raster + bar chart
+  const graceVisParamsRef = useRef<{ absMax: number } | null>(null);
   // Legend state — driven by the same visParams
   const [graceLegendRange, setGraceLegendRange] = useState<{ lo: number; hi: number } | null>(null);
 
@@ -226,7 +226,7 @@ export default function GraceExplorer() {
   //   2. Clips strictly to the AOI bbox — only pixels inside the rectangle are
   //      coloured; the overlay itself is bounded to that bbox so nothing outside
   //      is visible.
-  //   3. Color ramp uses graceVisParamsRef (lo=series_min, hi=series_max) — the
+  //   3. Color ramp uses graceVisParamsRef (absMax = max(|min|,|max|)) — the
   //      EXACT same values shown as Min/Max in the regional stats box.
   //   4. White point is fixed at 0 (asymmetric ramp: blue side spans 0→lo,
   //      red side spans 0→hi).
@@ -253,15 +253,12 @@ export default function GraceExplorer() {
       }
       const { values, nLat, nLon } = grid;
 
-      // ── visParams: exact regional stats (same as Min/Max in the stats box) ────
-      // lo maps to full blue, hi maps to full red, 0 always = white.
-      // Asymmetric: blue half spans lo→0, red half spans 0→hi.
+      // ── visParams: symmetric ±absMax (same scale as bar chart Y-axis) ────────
+      // min = -absMax → full blue (#0000ff)
+      // 0            → white   (#ffffff)
+      // max = +absMax → full red  (#ff0000)
       const vp = graceVisParamsRef.current;
-      const lo = vp ? vp.lo : (grid.vmin < 0 ? grid.vmin : -0.01); // series min (blue end)
-      const hi = vp ? vp.hi : (grid.vmax > 0 ? grid.vmax :  0.01); // series max (red end)
-      // Normalisation denominators (never zero)
-      const negRange = Math.abs(lo) > 0.001 ? Math.abs(lo) : 0.001; // |lo| — full blue at lo
-      const posRange = Math.abs(hi) > 0.001 ? Math.abs(hi) : 0.001; // hi  — full red  at hi
+      const absMax = vp ? vp.absMax : Math.max(Math.abs(grid.vmin), Math.abs(grid.vmax), 0.01);
 
       // ── Determine which grid rows/cols fall inside the AOI ───────────────
       // Grid: row 0 = 89.75°N, step −0.5° — col 0 = −179.75°, step +0.5°
@@ -296,19 +293,19 @@ export default function GraceExplorer() {
             d[px] = 0; d[px+1] = 0; d[px+2] = 0; d[px+3] = 0; // transparent
             continue;
           }
+          // Symmetric scale: -absMax→blue(0,0,255)  0→white(255,255,255)  +absMax→red(255,0,0)
+          const s = Math.min(1, Math.abs(v) / absMax); // normalised intensity [0,1]
           let r: number, g: number, b: number;
           if (v <= 0) {
-            // Negative or zero: interpolate white (v=0) → blue (v=lo)
-            const s = Math.min(1, Math.abs(v) / negRange); // 0 at v=0, 1 at v≤lo
-            r = Math.round(255 - s * 255);
-            g = Math.round(255 - s * 155);
-            b = Math.round(220 + s * 35);
+            // Negative → interpolate white→blue
+            r = Math.round(255 * (1 - s));
+            g = Math.round(255 * (1 - s));
+            b = 255;
           } else {
-            // Positive: interpolate white (v=0) → red (v=hi)
-            const s = Math.min(1, v / posRange);           // 0 at v=0, 1 at v≥hi
-            r = Math.round(255 - s * 35);
-            g = Math.round(255 - s * 215);
-            b = Math.round(255 - s * 215);
+            // Positive → interpolate white→red
+            r = 255;
+            g = Math.round(255 * (1 - s));
+            b = Math.round(255 * (1 - s));
           }
           d[px] = r; d[px+1] = g; d[px+2] = b; d[px+3] = 255;
         }
@@ -383,10 +380,12 @@ export default function GraceExplorer() {
       if (annualVals.length > 0) {
         const seriesMin = Math.min(...annualVals);
         const seriesMax = Math.max(...annualVals);
-        // Store for raster renderer
-        graceVisParamsRef.current = { lo: seriesMin, hi: seriesMax };
-        // Also keep absMax for bar-chart barColor intensity
+        // Unified symmetric scale: absMax = max(|min|, |max|)
+        // Raster: visParams min=-absMax, max=+absMax (0 always = white)
+        // Bar chart: YAxis domain [-absMax, +absMax]
+        // Legend: colour ramp ±absMax but labels show actual lo/hi
         const newAbsMax = Math.max(Math.abs(seriesMin), Math.abs(seriesMax), 0.01);
+        graceVisParamsRef.current = { absMax: newAbsMax };
         graceChartAbsMaxRef.current = newAbsMax;
         setGraceLegendRange({ lo: seriesMin, hi: seriesMax });
       }
@@ -1042,24 +1041,20 @@ export default function GraceExplorer() {
 
   const maxAbs = chartData.reduce((m, d) => Math.max(m, Math.abs(d.value ?? 0)), 0);
 
-  // barColor: intensity-matched to the raster — same absMax, same diverging scale.
-  // A bar at +20 cm gets the same redness as the raster pixel at +20 cm.
+  // barColor: exact same symmetric scale as raster
+  // -absMax→blue(0,0,255)  0→white(255,255,255)  +absMax→red(255,0,0)
+  const chartAbsMax = graceChartAbsMaxRef.current || maxAbs || 0.01;
   const barColor = (v: number | null): string => {
     if (v === null) return "#444";
-    const scale = maxAbs > 0 ? Math.min(1, Math.abs(v) / maxAbs) : 0;
+    const s = Math.min(1, Math.abs(v) / chartAbsMax);
     if (v >= 0) {
-      // positive: white (255,255,255) → red (220,40,40)
-      const r = Math.round(255 - scale * 35);
-      const g = Math.round(255 - scale * 215);
-      const b = Math.round(255 - scale * 215);
-      return `rgb(${r},${g},${b})`;
+      // positive → white→red
+      const c = Math.round(255 * (1 - s));
+      return `rgb(255,${c},${c})`;
     } else {
-      // negative: white → blue (0,100,220)
-      const s = scale;
-      const r = Math.round(255 - s * 255);
-      const g = Math.round(255 - s * 155);
-      const b = Math.round(220 + s * 35);
-      return `rgb(${r},${g},${b})`;
+      // negative → white→blue
+      const c = Math.round(255 * (1 - s));
+      return `rgb(${c},${c},255)`;
     }
   };
 
@@ -1894,7 +1889,14 @@ export default function GraceExplorer() {
                     <BarChart data={chartData} margin={{ top: 4, right: 10, left: -8, bottom: 4 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#21262d" vertical={false}/>
                       <XAxis dataKey="label" tick={{ fill: "#6e7681", fontSize: 10, fontFamily: "monospace" }} tickLine={false} axisLine={{ stroke: "#30363d" }} interval={chartMode === "annual" ? 2 : 11}/>
-                      <YAxis tick={{ fill: "#6e7681", fontSize: 10, fontFamily: "monospace" }} tickLine={false} axisLine={false} tickFormatter={(v: number) => v.toFixed(0)} width={36}/>
+                      <YAxis
+                        tick={{ fill: "#6e7681", fontSize: 10, fontFamily: "monospace" }}
+                        tickLine={false}
+                        axisLine={false}
+                        tickFormatter={(v: number) => v.toFixed(0)}
+                        width={36}
+                        domain={chartAbsMax > 0 ? [-chartAbsMax, chartAbsMax] : ["auto", "auto"]}
+                      />
                       <Tooltip
                         contentStyle={{ background: "#161b22", border: "1px solid #30363d", borderRadius: 6, fontSize: 11, fontFamily: "monospace", color: "#e6edf3" }}
                         cursor={{ fill: "#21262d" }}
