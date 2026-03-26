@@ -102,6 +102,13 @@ export default function GraceExplorer() {
   const [geoLoading, setGeoLoading] = useState(false);
   const [geoError, setGeoError] = useState<string | null>(null);
 
+  // GRACE raster overlay
+  const [graceRasterYear, setGraceRasterYear] = useState(2024);
+  const [graceRasterOpacity, setGraceRasterOpacity] = useState(0.7);
+  const graceImageOverlayRef = useRef<L.ImageOverlay | null>(null);
+  const graceRasterOpacityRef = useRef(0.7);
+  useEffect(() => { graceRasterOpacityRef.current = graceRasterOpacity; }, [graceRasterOpacity]);
+
   // Geologic map overlay
   const [geoOpacity, setGeoOpacity] = useState(0);
   const macroLayerRef = useRef<L.TileLayer | null>(null);
@@ -155,31 +162,23 @@ export default function GraceExplorer() {
     setTcError(null);
   }, [pendingQuery, status?.loaded]);
 
-  // Draw tile grid on map + persistent AOI outline
+  // Render GRACE raster once data is loaded, and re-render when year changes
+  useEffect(() => {
+    if (!status?.loaded) return;
+    renderGraceRaster(graceRasterYear, graceRasterOpacity);
+  }, [status?.loaded, graceRasterYear]);
+
+  // Update opacity without re-fetching
+  useEffect(() => {
+    if (graceImageOverlayRef.current) {
+      graceImageOverlayRef.current.setOpacity(graceRasterOpacity);
+    }
+  }, [graceRasterOpacity]);
+
+  // Draw persistent AOI outline only (GRACE pixel tiles removed per user request)
   // originalCoords = the actual click/search coords (not GRACE-snapped) for TC AOI placement
   const drawTiles = useCallback((result: QueryResult, originalCoords?: { lat: number; lon: number }) => {
     if (!leafletMap.current) return;
-
-    // ── GRACE tile layer ──────────────────────────────────────────
-    if (!tileLayerRef.current) {
-      tileLayerRef.current = new L.FeatureGroup().addTo(leafletMap.current);
-    } else {
-      tileLayerRef.current.clearLayers();
-    }
-    const half = 0.25;
-    if (result.cells && result.cells.length > 0) {
-      for (const c of result.cells) {
-        L.rectangle(
-          [[c.lat - half, c.lon - half], [c.lat + half, c.lon + half]],
-          { color: "#0891b2", weight: 1.5, fill: true, fillColor: "#22d3ee", fillOpacity: 0.25, interactive: false }
-        ).addTo(tileLayerRef.current!);
-      }
-    } else if (result.lat !== undefined && result.lon !== undefined) {
-      L.rectangle(
-        [[result.lat - half, result.lon - half], [result.lat + half, result.lon + half]],
-        { color: "#0891b2", weight: 2, fill: true, fillColor: "#22d3ee", fillOpacity: 0.20, dashArray: "4 3", interactive: false }
-      ).addTo(tileLayerRef.current!);
-    }
 
     // ── AOI / TerraClimate bounding box (separate layer, always on top) ──
     if (!aoiLayerRef.current) {
@@ -205,6 +204,82 @@ export default function GraceExplorer() {
       ).addTo(aoiLayerRef.current!);
     }
   }, []);
+
+  // ── GRACE raster renderer ─────────────────────────────────────────────────
+  // Fetches annual mean grid from backend, renders to a canvas, and places it
+  // as a Leaflet ImageOverlay covering the full globe.
+  const renderGraceRaster = useCallback(async (year: number, opacity: number) => {
+    if (!leafletMap.current) return;
+    const API_BASE_R = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+    try {
+      const resp = await fetch(`${API_BASE_R}/api/grace-raster?year=${year}`);
+      if (!resp.ok) return;
+      const grid = await resp.json();
+      const { values, nLat, nLon, vmin, vmax } = grid as {
+        values: number[]; nLat: number; nLon: number;
+        vmin: number; vmax: number;
+      };
+
+      // Build canvas
+      const canvas = document.createElement('canvas');
+      canvas.width = nLon;
+      canvas.height = nLat;
+      const ctx = canvas.getContext('2d')!;
+      const imgData = ctx.createImageData(nLon, nLat);
+      const d = imgData.data;
+
+      // Diverging blue→white→red, symmetric around 0
+      const absMax = Math.max(Math.abs(vmin), Math.abs(vmax), 0.01);
+      for (let i = 0; i < nLat * nLon; i++) {
+        const v = values[i];
+        let r = 30, g = 30, b = 30, a = 0;
+        if (v !== -99999) {
+          const t = Math.max(-1, Math.min(1, v / absMax)); // -1 to +1
+          if (t < 0) {
+            // negative: blue (0,100,200) → white
+            const s = -t; // 0..1 strength
+            r = Math.round(255 - s * (255 - 0));
+            g = Math.round(255 - s * (255 - 100));
+            b = Math.round(255 - s * (255 - 220));
+          } else {
+            // positive: white → red (220,40,40)
+            const s = t;
+            r = Math.round(255 - s * (255 - 220));
+            g = Math.round(255 - s * 215);
+            b = Math.round(255 - s * 215);
+          }
+          a = 255;
+        }
+        const px = i * 4;
+        d[px] = r; d[px+1] = g; d[px+2] = b; d[px+3] = a;
+      }
+      ctx.putImageData(imgData, 0, 0);
+      const dataUrl = canvas.toDataURL('image/png');
+
+      // Place as Leaflet ImageOverlay covering full globe
+      const bounds: L.LatLngBoundsExpression = [[-90, -180], [90, 180]];
+      if (graceImageOverlayRef.current) {
+        graceImageOverlayRef.current.remove();
+      }
+      const overlay = L.imageOverlay(dataUrl, bounds, {
+        opacity,
+        zIndex: 195,
+        interactive: false,
+        className: 'grace-raster-overlay',
+      });
+      overlay.addTo(leafletMap.current);
+      graceImageOverlayRef.current = overlay;
+    } catch (e) {
+      console.error('[GRACE Raster]', e);
+    }
+  }, []);
+
+  // Fetch raster on mount (once GRACE data ready) and when year changes
+  const { data: rasterStatus } = useQuery<{ loaded: boolean }>({
+    queryKey: ["/api/status"],
+    select: (d: any) => ({ loaded: d.loaded }),
+    refetchInterval: false,
+  });
 
   // Convert raw fetch/HTTP errors into user-friendly messages
   function friendlyError(e: any): string {
@@ -324,10 +399,9 @@ export default function GraceExplorer() {
       } else {
         reliefShadeLayerRef.current.setOpacity(op * 0.35);
       }
-      // Keep layers in correct order: geology → rivers → GRACE/AOI on top
+      // Keep layers in correct order: geology → rivers → AOI on top
       if (macroLayerRef.current)  macroLayerRef.current.setZIndex(200);
       if (riversLayerRef.current) riversLayerRef.current.bringToFront();
-      if (tileLayerRef.current)   tileLayerRef.current.bringToFront();
       if (aoiLayerRef.current)    aoiLayerRef.current.bringToFront();
     }
   }, [reliefOpacity]);
@@ -358,8 +432,7 @@ export default function GraceExplorer() {
           fillColor: color, fillOpacity: 0.08, opacity: 0.75, interactive: false,
         },
       }).addTo(leafletMap.current);
-      // Keep watersheds below GRACE/AOI
-      if (tileLayerRef.current) tileLayerRef.current.bringToFront();
+      // Keep AOI on top of watersheds
       if (aoiLayerRef.current)  aoiLayerRef.current.bringToFront();
     } catch (_) { /* ignore fetch errors */ } finally {
       wsLoadingRef.current[key] = false;
@@ -451,10 +524,9 @@ export default function GraceExplorer() {
           { opacity: geoOpacity / 100, maxZoom: 19, attribution: 'Geology © <a href="https://macrostrat.org">Macrostrat</a>' }
         );
         macroLayerRef.current.addTo(leafletMap.current);
-        // Keep geology below rivers/GRACE/AOI layers
+        // Keep geology below rivers/AOI layers
         macroLayerRef.current.setZIndex(200);
         if (riversLayerRef.current) riversLayerRef.current.bringToFront();
-        if (tileLayerRef.current)   tileLayerRef.current.bringToFront();
         if (aoiLayerRef.current)    aoiLayerRef.current.bringToFront();
       } else {
         macroLayerRef.current.setOpacity(geoOpacity / 100);
@@ -545,8 +617,7 @@ export default function GraceExplorer() {
           if (corner1MarkerRef.current) { map.removeLayer(corner1MarkerRef.current); corner1MarkerRef.current = null; }
           if (clickMarkerRef.current) { map.removeLayer(clickMarkerRef.current); clickMarkerRef.current = null; }
 
-          // Just clear the tile layer — drawTiles() will redraw the AOI rect in blue
-          if (tileLayerRef.current) tileLayerRef.current.clearLayers();
+          // drawTiles() will redraw the AOI rect in blue
 
           corner1Ref.current = null;
           rectStepRef.current = 0;
@@ -600,7 +671,6 @@ export default function GraceExplorer() {
 
       if (clickMarkerRef.current) map.removeLayer(clickMarkerRef.current);
       clickMarkerRef.current = L.marker([lat, lng], { icon: cyanIcon }).addTo(map);
-      if (tileLayerRef.current) tileLayerRef.current.clearLayers();
       if (aoiLayerRef.current) aoiLayerRef.current.clearLayers();
       setLocationName(`Point (${lat.toFixed(3)}°N, ${lng.toFixed(3)}°E)`);
       setPendingQuery({ type: "point", params: { lat, lon: lng } });
@@ -1097,6 +1167,58 @@ export default function GraceExplorer() {
             <span style={{ fontSize: "10px", color: reliefOpacity > 0 ? "#34d399" : "#484f58", fontFamily: "monospace", width: 28, textAlign: "right" }}>
               {reliefOpacity > 0 ? `${reliefOpacity}%` : "off"}
             </span>
+          </div>
+
+          {/* GRACE RASTER OVERLAY CONTROLS */}
+          <div style={{ display: "flex", alignItems: "center", gap: 7, flexShrink: 0 }}>
+            {/* GRACE satellite icon */}
+            <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
+              <circle cx="7" cy="7" r="5.5" stroke="#f59e0b" strokeWidth="1.3"/>
+              <circle cx="7" cy="7" r="2" fill="#f59e0b" fillOpacity="0.6"/>
+              <line x1="7" y1="1" x2="7" y2="3" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
+              <line x1="7" y1="11" x2="7" y2="13" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
+              <line x1="1" y1="7" x2="3" y2="7" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
+              <line x1="11" y1="7" x2="13" y2="7" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
+            </svg>
+            <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>GRACE</span>
+            {/* Year selector */}
+            <select
+              value={graceRasterYear}
+              onChange={(e) => setGraceRasterYear(Number(e.target.value))}
+              title="GRACE LWE overlay year"
+              style={{
+                height: 26, padding: "0 4px", fontSize: "11px", fontFamily: "monospace",
+                background: "#0d1117", border: "1px solid #f59e0b60", borderRadius: 4,
+                color: "#f59e0b", cursor: "pointer", outline: "none",
+              }}
+            >
+              {Array.from({ length: 2026 - 2002 + 1 }, (_, i) => 2002 + i).map(y => (
+                <option key={y} value={y}>{y}</option>
+              ))}
+            </select>
+            {/* Opacity/saturation slider */}
+            <input
+              type="range" min={0} max={100} step={5}
+              value={Math.round(graceRasterOpacity * 100)}
+              onChange={(e) => setGraceRasterOpacity(Number(e.target.value) / 100)}
+              title={`GRACE raster opacity: ${Math.round(graceRasterOpacity * 100)}%`}
+              style={{ width: 72, accentColor: "#f59e0b", cursor: "pointer" }}
+            />
+            <span style={{ fontSize: "10px", color: graceRasterOpacity > 0 ? "#f59e0b" : "#484f58", fontFamily: "monospace", width: 28, textAlign: "right" }}>
+              {graceRasterOpacity > 0 ? `${Math.round(graceRasterOpacity * 100)}%` : "off"}
+            </span>
+            {/* Compact diverging color legend: blue=negative, white=0, red=positive */}
+            <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, marginLeft: 2 }}>
+              <div style={{
+                width: 48, height: 10, borderRadius: 3,
+                background: "linear-gradient(to right, rgb(0,100,220), rgb(255,255,255), rgb(220,40,40))",
+                border: "1px solid #30363d",
+              }}/>
+              <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+                <span style={{ fontSize: "8px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1 }}>−LWE</span>
+                <span style={{ fontSize: "8px", color: "#f87171", fontFamily: "monospace", lineHeight: 1 }}>+LWE</span>
+              </div>
+            </div>
           </div>
 
           {/* Divider */}

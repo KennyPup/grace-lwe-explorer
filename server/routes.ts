@@ -1,6 +1,6 @@
 import type { Express } from "express";
 import type { Server } from "http";
-import { loadGraceData, getStatus, queryPoint, queryBBox, exportBBoxData } from "./grace";
+import { loadGraceData, getStatus, queryPoint, queryBBox, exportBBoxData, getAnnualMeanGrid } from "./grace";
 import { queryTerraClimatePoint, queryTerraClimateBBox } from "./terraclimate";
 import { getGeologySummary } from "./geology";
 import { execFile } from "child_process";
@@ -15,6 +15,16 @@ export function registerRoutes(httpServer: Server, app: Express) {
   // Status endpoint — poll this to know when data is ready
   app.get("/api/status", (_req, res) => {
     res.json(getStatus());
+  });
+
+  // GRACE annual mean raster: ?year=2024
+  // Returns a compact JSON grid for canvas rendering on the client.
+  // values is a flat [nLat*nLon] array, row 0 = northernmost, col 0 = -180°.
+  app.get("/api/grace-raster", (req, res) => {
+    const year = parseInt(req.query.year as string) || 2024;
+    const grid = getAnnualMeanGrid(year);
+    if (!grid) return res.status(503).json({ error: "GRACE data not loaded yet" });
+    res.json(grid);
   });
 
   // Point query: ?lat=36.5&lon=-118.5

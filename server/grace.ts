@@ -277,3 +277,73 @@ export function exportBBoxData(minLat: number, maxLat: number, minLon: number, m
     minLat, maxLat, minLon, maxLon,
   };
 }
+
+
+/**
+ * Compute per-pixel annual mean LWE for a given year.
+ * Returns a flat grid [nLat * nLon], row 0 = northernmost lat, col 0 = -180°.
+ * nodata = -99999.
+ */
+export function getAnnualMeanGrid(year: number): {
+  values: number[];
+  nLat: number;
+  nLon: number;
+  lats: number[];   // length nLat, north→south
+  lons: number[];   // length nLon, -180→+180
+  vmin: number;
+  vmax: number;
+  year: number;
+  nMonths: number;
+} | null {
+  if (!loaded || !lweBuffer) return null;
+
+  // Origin for day-offset times
+  const originMs = Date.UTC(2002, 0, 1);
+
+  // Collect timestep indices that fall in the requested year
+  const yearIdxs: number[] = [];
+  for (let ti = 0; ti < nTime; ti++) {
+    const d = new Date(originMs + times[ti] * 86400000);
+    if (d.getUTCFullYear() === year) yearIdxs.push(ti);
+  }
+  if (yearIdxs.length === 0) return null;
+
+  const N = yearIdxs.length;
+  const total = nLat * nLon;
+  const half = nLon / 2; // 360 — split for -180→180 reorder
+
+  // Compute mean per pixel; flip rows (lats are S→N in buffer, need N→S for image)
+  // and shift columns from 0→360 to -180→180 simultaneously
+  const result: number[] = new Array(total);
+  let vmin = Infinity, vmax = -Infinity;
+
+  for (let li = 0; li < nLat; li++) {
+    const row = nLat - 1 - li; // flip: li=0 (southmost) → row=359 (bottom)
+    for (let col = 0; col < nLon; col++) {
+      const loi = (col + half) % nLon; // shift: col 0 → loi 360 (i.e. -180°)
+      let sum = 0, cnt = 0;
+      for (const ti of yearIdxs) {
+        const v = getLWE(ti, li, loi);
+        if (isValidLWE(v)) { sum += v; cnt++; }
+      }
+      const mean = cnt > 0 ? sum / cnt : -99999;
+      result[row * nLon + col] = mean;
+      if (mean !== -99999) {
+        if (mean < vmin) vmin = mean;
+        if (mean > vmax) vmax = mean;
+      }
+    }
+  }
+
+  // Build output lat/lon arrays (N→S, -180→+180)
+  const outLats: number[] = [];
+  for (let i = nLat - 1; i >= 0; i--) outLats.push(lats[i]);
+  const outLons: number[] = [];
+  for (let col = 0; col < nLon; col++) {
+    let lo = lons[(col + half) % nLon];
+    if (lo > 180) lo -= 360;
+    outLons.push(lo);
+  }
+
+  return { values: result, nLat, nLon, lats: outLats, lons: outLons, vmin, vmax, year, nMonths: N };
+}
