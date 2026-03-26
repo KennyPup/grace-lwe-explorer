@@ -112,10 +112,13 @@ export default function GraceExplorer() {
   // Cache for raw grid data per year — so AOI stretch doesn't require a refetch
   type GraceGrid = { values: number[]; nLat: number; nLon: number; vmin: number; vmax: number };
   const graceGridCacheRef = useRef<Record<number, GraceGrid>>({});
-  // Current AOI bounds for local color stretch — updated whenever a query result arrives
+  // Current AOI bounds — used only to derive which raster pixels are "inside" the AOI
   const graceAoiRef = useRef<{ minLat: number; maxLat: number; minLon: number; maxLon: number } | null>(null);
-  // Legend state — shown min/max for the active stretch
-  const [graceLegendRange, setGraceLegendRange] = useState<{ lo: number; hi: number } | null>(null);
+  // absMax derived from the bar-chart time series — THE authoritative scale for both chart and raster
+  // Set whenever queryResult.annual is available; drives raster color normalization.
+  const graceChartAbsMaxRef = useRef<number>(0);
+  // Legend state — shown min/max for the active stretch (lo/hi = actual chart series range)
+  const [graceLegendRange, setGraceLegendRange] = useState<{ lo: number; hi: number; absMax: number } | null>(null);
 
   // Geologic map overlay
   const [geoOpacity, setGeoOpacity] = useState(0);
@@ -214,20 +217,21 @@ export default function GraceExplorer() {
   }, []);
 
   // ── GRACE raster renderer ─────────────────────────────────────────────────
-  // Fetches/caches the annual mean grid from backend, then paints a canvas with
-  // a diverging blue→white→red color scale stretched to the AOI if one is set,
-  // or to the global min/max otherwise.  Places result as a Leaflet ImageOverlay.
+  // Fetches/caches the annual mean grid, then paints a canvas using the SAME
+  // absMax that normalizes the bar chart.  This means:
+  //   • The bar chart value for any year maps to EXACTLY the same color on the map.
+  //   • 0 LWE anomaly = white on both chart and map.
+  //   • Blue = negative anomaly (water loss relative to baseline).
+  //   • Red  = positive anomaly (water gain relative to baseline).
   //
-  // Color stretch logic:
-  //   - If graceAoiRef.current is set: compute vmin/vmax from pixels inside the bbox
-  //   - Otherwise: use global vmin/vmax from the full grid
-  //   - The scale is symmetric around 0: absMax = max(|vmin|, |vmax|)
-  //   - Pixels outside the scale clamp at -1/+1 (full blue/red)
+  // absMax priority (highest to lowest):
+  //   1. graceChartAbsMaxRef — set from queryResult.annual when an AOI is queried
+  //   2. Global grid vmin/vmax — fallback when no AOI has been selected
   const renderGraceRaster = useCallback(async (year: number, opacity: number) => {
     if (!leafletMap.current) return;
     const API_BASE_R = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
     try {
-      // Fetch or use cached grid
+      // ── Fetch or use cached grid ─────────────────────────────────────────
       let grid = graceGridCacheRef.current[year];
       if (!grid) {
         const resp = await fetch(`${API_BASE_R}/api/grace-raster?year=${year}`);
@@ -238,38 +242,13 @@ export default function GraceExplorer() {
       }
       const { values, nLat, nLon } = grid;
 
-      // ── Compute local min/max if an AOI is set ────────────────────────────
-      // Grid row 0 = north (+89.75°), col 0 = west (-179.75°), step = 0.5°
-      let absMax: number;
-      const aoi = graceAoiRef.current;
-      if (aoi) {
-        let localMin = Infinity, localMax = -Infinity;
-        for (let row = 0; row < nLat; row++) {
-          // row 0 = 89.75°N, step -0.5°
-          const lat = 89.75 - row * 0.5;
-          if (lat < aoi.minLat - 0.25 || lat > aoi.maxLat + 0.25) continue;
-          for (let col = 0; col < nLon; col++) {
-            // col 0 = -179.75°, step +0.5°
-            const lon = -179.75 + col * 0.5;
-            if (lon < aoi.minLon - 0.25 || lon > aoi.maxLon + 0.25) continue;
-            const v = values[row * nLon + col];
-            if (v === -99999) continue;
-            if (v < localMin) localMin = v;
-            if (v > localMax) localMax = v;
-          }
-        }
-        if (localMin === Infinity) {
-          // No valid pixels in AOI — fall back to global
-          absMax = Math.max(Math.abs(grid.vmin), Math.abs(grid.vmax), 0.01);
-          setGraceLegendRange(null);
-        } else {
-          absMax = Math.max(Math.abs(localMin), Math.abs(localMax), 0.01);
-          setGraceLegendRange({ lo: localMin, hi: localMax });
-        }
-      } else {
-        absMax = Math.max(Math.abs(grid.vmin), Math.abs(grid.vmax), 0.01);
-        setGraceLegendRange(null);
-      }
+      // ── Determine absMax ────────────────────────────────────────────────
+      // Use the chart's absMax if we have one (derived from queryResult.annual),
+      // otherwise fall back to global grid range.
+      const chartAbsMax = graceChartAbsMaxRef.current;
+      const absMax = chartAbsMax > 0
+        ? chartAbsMax
+        : Math.max(Math.abs(grid.vmin), Math.abs(grid.vmax), 0.01);
 
       // ── Paint canvas ─────────────────────────────────────────────────────
       const canvas = document.createElement('canvas');
@@ -283,16 +262,17 @@ export default function GraceExplorer() {
         const v = values[i];
         let r = 0, g = 0, b = 0, a = 0;
         if (v !== -99999) {
-          const t = Math.max(-1, Math.min(1, v / absMax)); // -1 to +1
+          // t in [-1, +1]: proportional to the same scale as the bar chart
+          const t = Math.max(-1, Math.min(1, v / absMax));
           if (t < 0) {
-            // Negative LWE: blue (0,100,220) → white
-            const s = -t;
+            // Negative anomaly (water loss): white → blue (0, 100, 220)
+            const s = -t; // 0 = white, 1 = full blue
             r = Math.round(255 - s * 255);
             g = Math.round(255 - s * 155);
-            b = 220 + Math.round((1 - s) * 35); // 220→255 as s→1
+            b = Math.round(220 + s * 35); // 220 (near-white) → 255 (pure blue end)
           } else {
-            // Positive LWE: white → red (220,40,40)
-            const s = t;
+            // Positive anomaly (water gain): white → red (220, 40, 40)
+            const s = t;  // 0 = white, 1 = full red
             r = Math.round(255 - s * 35);
             g = Math.round(255 - s * 215);
             b = Math.round(255 - s * 215);
@@ -318,7 +298,7 @@ export default function GraceExplorer() {
     } catch (e) {
       console.error('[GRACE Raster]', e);
     }
-  }, []); // graceAoiRef & graceGridCacheRef are refs — stable references
+  }, []); // all reads are via stable refs — no closure staleness
 
   // Expose a ref-stable re-render function so runQuery can call it after AOI update
   const renderGraceRasterRef = useRef(renderGraceRaster);
@@ -355,8 +335,22 @@ export default function GraceExplorer() {
       const orig = q.type === "point" ? { lat: q.params.lat, lon: q.params.lon } : undefined;
       drawTiles(data, orig);
 
-      // ── Update GRACE AOI for local color stretch ─────────────────────────────
-      // For a region bbox use it directly; for a point use the GRACE-snapped cell ±0.25°
+      // ── Derive absMax from the bar-chart time series ────────────────────────
+      // This is THE single source of truth that drives both bar-chart Y-axis and
+      // raster color normalization.  Both will share an identical scale where
+      // 0 = white, negative = blue, positive = red.
+      const annualVals = (data.annual as SeriesPoint[])
+        .map((d) => d.lwe)
+        .filter((v): v is number => v !== null && v !== undefined);
+      if (annualVals.length > 0) {
+        const seriesMin = Math.min(...annualVals);
+        const seriesMax = Math.max(...annualVals);
+        const newAbsMax = Math.max(Math.abs(seriesMin), Math.abs(seriesMax), 0.01);
+        graceChartAbsMaxRef.current = newAbsMax;
+        setGraceLegendRange({ lo: seriesMin, hi: seriesMax, absMax: newAbsMax });
+      }
+
+      // Store AOI bounds (still used for potential future spatial queries)
       if (data.bbox) {
         graceAoiRef.current = {
           minLat: data.bbox.minLat, maxLat: data.bbox.maxLat,
@@ -368,7 +362,8 @@ export default function GraceExplorer() {
           minLon: data.lon - 0.25, maxLon: data.lon + 0.25,
         };
       }
-      // Re-paint raster with the new local stretch (grid is cached, no re-fetch)
+
+      // Re-paint raster with the chart-matched scale (grid is cached, no re-fetch)
       renderGraceRasterRef.current(graceRasterYear, graceRasterOpacityRef.current);
     } catch (e: any) {
       setQueryError(friendlyError(e));
@@ -1005,7 +1000,27 @@ export default function GraceExplorer() {
     : [];
 
   const maxAbs = chartData.reduce((m, d) => Math.max(m, Math.abs(d.value ?? 0)), 0);
-  const barColor = (v: number | null) => v === null ? "#444" : v >= 0 ? "#22d3ee" : "#f87171";
+
+  // barColor: intensity-matched to the raster — same absMax, same diverging scale.
+  // A bar at +20 cm gets the same redness as the raster pixel at +20 cm.
+  const barColor = (v: number | null): string => {
+    if (v === null) return "#444";
+    const scale = maxAbs > 0 ? Math.min(1, Math.abs(v) / maxAbs) : 0;
+    if (v >= 0) {
+      // positive: white (255,255,255) → red (220,40,40)
+      const r = Math.round(255 - scale * 35);
+      const g = Math.round(255 - scale * 215);
+      const b = Math.round(255 - scale * 215);
+      return `rgb(${r},${g},${b})`;
+    } else {
+      // negative: white → blue (0,100,220)
+      const s = scale;
+      const r = Math.round(255 - s * 255);
+      const g = Math.round(255 - s * 155);
+      const b = Math.round(220 + s * 35);
+      return `rgb(${r},${g},${b})`;
+    }
+  };
 
   const isReady = status?.loaded;
   const isError = !!status?.loadError;
@@ -1266,25 +1281,32 @@ export default function GraceExplorer() {
             <span style={{ fontSize: "10px", color: graceRasterOpacity > 0 ? "#f59e0b" : "#484f58", fontFamily: "monospace", width: 28, textAlign: "right" }}>
               {graceRasterOpacity > 0 ? `${Math.round(graceRasterOpacity * 100)}%` : "off"}
             </span>
-            {/* Diverging color legend — shows AOI-local range when available */}
+            {/* Diverging color legend — shares the bar-chart scale once an AOI is selected */}
             <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, marginLeft: 2 }}>
-              {/* Left label: min or −LWE */}
-              <span style={{ fontSize: "8px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1, textAlign: "right", minWidth: 28 }}>
-                {graceLegendRange ? `${graceLegendRange.lo.toFixed(1)}` : "−"}
+              {/* Left label: −absMax (full blue extreme) */}
+              <span style={{ fontSize: "8px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1, textAlign: "right", minWidth: 30 }}>
+                {graceLegendRange ? `−${graceLegendRange.absMax.toFixed(1)}` : "−"}
               </span>
-              {/* Gradient bar */}
-              <div style={{
-                width: 52, height: 10, borderRadius: 3, flexShrink: 0,
-                background: "linear-gradient(to right, rgb(0,100,220), rgb(255,255,255), rgb(220,40,40))",
-                border: `1px solid ${graceLegendRange ? "#f59e0b80" : "#30363d"}`,
-                boxShadow: graceLegendRange ? "0 0 4px #f59e0b40" : "none",
-              }}/>
-              {/* Right label: max or +LWE */}
-              <span style={{ fontSize: "8px", color: "#f87171", fontFamily: "monospace", lineHeight: 1, minWidth: 28 }}>
-                {graceLegendRange ? `${graceLegendRange.hi.toFixed(1)}` : "+"}
+              {/* Gradient bar with tick at center (= 0) */}
+              <div style={{ position: "relative", flexShrink: 0 }}>
+                <div style={{
+                  width: 52, height: 10, borderRadius: 3,
+                  background: "linear-gradient(to right, rgb(0,100,220), rgb(255,255,255), rgb(220,40,40))",
+                  border: `1px solid ${graceLegendRange ? "#f59e0b80" : "#30363d"}`,
+                  boxShadow: graceLegendRange ? "0 0 4px #f59e0b40" : "none",
+                }}/>
+                {/* Centre tick = 0 LWE */}
+                <div style={{
+                  position: "absolute", top: -2, left: "calc(50% - 0.5px)",
+                  width: 1, height: 14, background: "#ffffff80", pointerEvents: "none",
+                }}/>
+              </div>
+              {/* Right label: +absMax (full red extreme) */}
+              <span style={{ fontSize: "8px", color: "#f87171", fontFamily: "monospace", lineHeight: 1, minWidth: 30 }}>
+                {graceLegendRange ? `+${graceLegendRange.absMax.toFixed(1)}` : "+"}
               </span>
               {graceLegendRange && (
-                <span style={{ fontSize: "7px", color: "#f59e0b", fontFamily: "monospace", lineHeight: 1 }}>AOI</span>
+                <span style={{ fontSize: "7px", color: "#f59e0b", fontFamily: "monospace", lineHeight: 1 }}>cm</span>
               )}
             </div>
           </div>
@@ -1832,10 +1854,39 @@ export default function GraceExplorer() {
                       <CartesianGrid strokeDasharray="3 3" stroke="#21262d" vertical={false}/>
                       <XAxis dataKey="label" tick={{ fill: "#6e7681", fontSize: 10, fontFamily: "monospace" }} tickLine={false} axisLine={{ stroke: "#30363d" }} interval={chartMode === "annual" ? 2 : 11}/>
                       <YAxis tick={{ fill: "#6e7681", fontSize: 10, fontFamily: "monospace" }} tickLine={false} axisLine={false} tickFormatter={(v: number) => v.toFixed(0)} width={36}/>
-                      <Tooltip contentStyle={{ background: "#161b22", border: "1px solid #30363d", borderRadius: 6, fontSize: 11, fontFamily: "monospace", color: "#e6edf3" }} cursor={{ fill: "#21262d" }} formatter={(val: number) => [`${val?.toFixed(2)} cm`, isBboxResult ? "Mean LWE" : "LWE"]}/>
-                      <ReferenceLine y={0} stroke="#30363d" strokeDasharray="4 2"/>
+                      <Tooltip
+                        contentStyle={{ background: "#161b22", border: "1px solid #30363d", borderRadius: 6, fontSize: 11, fontFamily: "monospace", color: "#e6edf3" }}
+                        cursor={{ fill: "#21262d" }}
+                        formatter={(val: number, _name: string, props: any) => {
+                          const isSelectedYear = chartMode === "annual" && props?.payload?.label === String(graceRasterYear);
+                          return [
+                            <span style={{ color: isSelectedYear ? "#f59e0b" : "#e6edf3" }}>
+                              {val?.toFixed(2)} cm{isSelectedYear ? " ★ map" : ""}
+                            </span>,
+                            isBboxResult ? "Mean LWE" : "LWE"
+                          ];
+                        }}
+                      />
+                      <ReferenceLine y={0} stroke="#484f58" strokeWidth={1} strokeDasharray="4 2"/>
+                      {/* Amber highlight band for the currently selected raster year */}
+                      {chartMode === "annual" && (
+                        <ReferenceLine
+                          x={String(graceRasterYear)}
+                          stroke="#f59e0b"
+                          strokeWidth={2}
+                          strokeDasharray="3 2"
+                          label={{ value: graceRasterYear, position: "top", fontSize: 8, fill: "#f59e0b", fontFamily: "monospace" }}
+                        />
+                      )}
                       <Bar dataKey="value" maxBarSize={chartMode === "annual" ? 22 : 5} radius={[2, 2, 0, 0]}>
-                        {chartData.map((d, i) => <Cell key={i} fill={barColor(d.value)}/>)}
+                        {chartData.map((d, i) => (
+                          <Cell
+                            key={i}
+                            fill={barColor(d.value)}
+                            stroke={chartMode === "annual" && d.label === String(graceRasterYear) ? "#f59e0b" : "none"}
+                            strokeWidth={chartMode === "annual" && d.label === String(graceRasterYear) ? 1.5 : 0}
+                          />
+                        ))}
                       </Bar>
                     </BarChart>
                   </ResponsiveContainer>
