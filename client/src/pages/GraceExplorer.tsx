@@ -804,6 +804,17 @@ export default function GraceExplorer() {
 
           const label = `Region (${minLat.toFixed(1)}°–${maxLat.toFixed(1)}°N, ${minLon.toFixed(1)}°–${maxLon.toFixed(1)}°E)`;
           setLocationName(label);
+
+          // Smooth fly-to: fit the AOI with 30% buffer padding
+          const latSpan = maxLat - minLat;
+          const lonSpan = maxLon - minLon;
+          const latPad = latSpan * 0.30;
+          const lonPad = lonSpan * 0.30;
+          map.flyToBounds(
+            [[minLat - latPad, minLon - lonPad], [maxLat + latPad, maxLon + lonPad]],
+            { animate: true, duration: 0.9, easeLinearity: 0.25 }
+          );
+
           setPendingQuery({ type: "bbox", params: { minLat, maxLat, minLon, maxLon } });
         }
         return;
@@ -852,6 +863,11 @@ export default function GraceExplorer() {
       clickMarkerRef.current = L.marker([lat, lng], { icon: cyanIcon }).addTo(map);
       if (aoiLayerRef.current) aoiLayerRef.current.clearLayers();
       setLocationName(`Point (${lat.toFixed(3)}°N, ${lng.toFixed(3)}°E)`);
+
+      // Smooth fly-to point: max zoom 12 to preserve geologic context
+      const targetZoom = Math.min(12, map.getZoom() < 6 ? 8 : map.getZoom() + 2);
+      map.flyTo([lat, lng], targetZoom, { animate: true, duration: 0.85, easeLinearity: 0.25 });
+
       setPendingQuery({ type: "point", params: { lat, lon: lng } });
     });
 
