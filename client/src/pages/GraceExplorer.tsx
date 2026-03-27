@@ -106,8 +106,18 @@ export default function GraceExplorer() {
   const [graceRasterYear, setGraceRasterYear] = useState(2024);
   const [graceRasterOpacity, setGraceRasterOpacity] = useState(0);
   const graceImageOverlayRef = useRef<L.ImageOverlay | null>(null);
+  const graceFadeOverlayRef = useRef<L.ImageOverlay | null>(null); // second layer for cross-fade
   const graceRasterOpacityRef = useRef(0);
   useEffect(() => { graceRasterOpacityRef.current = graceRasterOpacity; }, [graceRasterOpacity]);
+
+  // Playback animation state
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playFps, setPlayFps] = useState(1);
+  const playIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isPlayingRef = useRef(false);
+  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+  const playFpsRef = useRef(1);
+  useEffect(() => { playFpsRef.current = playFps; }, [playFps]);
 
   // Cache for raw grid data per year — so AOI stretch doesn't require a refetch
   type GraceGrid = { values: number[]; nLat: number; nLon: number; vmin: number; vmax: number };
@@ -342,6 +352,74 @@ export default function GraceExplorer() {
   // Expose a ref-stable re-render function so runQuery can call it after AOI update
   const renderGraceRasterRef = useRef(renderGraceRaster);
   useEffect(() => { renderGraceRasterRef.current = renderGraceRaster; }, [renderGraceRaster]);
+
+  // ── Background pre-fetch: silently cache grids for adjacent years ───────────────────
+  const prefetchYear = useCallback(async (year: number) => {
+    if (year < 2002 || year > 2026) return;
+    if (graceGridCacheRef.current[year]) return; // already cached
+    const API_BASE_P = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+    try {
+      const resp = await fetch(`${API_BASE_P}/api/grace-raster?year=${year}`);
+      if (!resp.ok) return;
+      const raw = await resp.json() as { values: number[]; nLat: number; nLon: number; vmin: number; vmax: number };
+      graceGridCacheRef.current[year] = { values: raw.values, nLat: raw.nLat, nLon: raw.nLon, vmin: raw.vmin, vmax: raw.vmax };
+    } catch { /* silent */ }
+  }, []);
+
+  // ── Playback engine ─────────────────────────────────────────────────────────────
+  const stopPlayback = useCallback(() => {
+    if (playIntervalRef.current) { clearInterval(playIntervalRef.current); playIntervalRef.current = null; }
+    setIsPlaying(false);
+  }, []);
+
+  const startPlayback = useCallback(() => {
+    if (playIntervalRef.current) clearInterval(playIntervalRef.current);
+    setIsPlaying(true);
+    playIntervalRef.current = setInterval(() => {
+      setGraceRasterYear(prev => {
+        const next = prev >= 2026 ? 2002 : prev + 1;
+        // Pre-fetch the year after next in background
+        const afterNext = next >= 2026 ? 2002 : next + 1;
+        prefetchYear(afterNext);
+        return next;
+      });
+    }, Math.round(1000 / playFpsRef.current));
+  }, [prefetchYear]);
+
+  const togglePlay = useCallback(() => {
+    if (isPlayingRef.current) { stopPlayback(); } else { startPlayback(); }
+  }, [startPlayback, stopPlayback]);
+
+  const stepYear = useCallback((delta: number) => {
+    stopPlayback();
+    setGraceRasterYear(prev => {
+      const n = prev + delta;
+      return n < 2002 ? 2026 : n > 2026 ? 2002 : n;
+    });
+  }, [stopPlayback]);
+
+  // Restart interval when FPS changes mid-play (keeps speed responsive)
+  useEffect(() => {
+    if (!isPlaying) return;
+    if (playIntervalRef.current) clearInterval(playIntervalRef.current);
+    playIntervalRef.current = setInterval(() => {
+      setGraceRasterYear(prev => {
+        const next = prev >= 2026 ? 2002 : prev + 1;
+        prefetchYear(next >= 2026 ? 2002 : next + 1);
+        return next;
+      });
+    }, Math.round(1000 / Math.max(0.1, playFps)));
+    return () => { if (playIntervalRef.current) clearInterval(playIntervalRef.current); };
+  }, [playFps, isPlaying, prefetchYear]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Pre-fetch adjacent years whenever selected year changes (manual or playback)
+  useEffect(() => {
+    prefetchYear(graceRasterYear + 1 > 2026 ? 2002 : graceRasterYear + 1);
+    prefetchYear(graceRasterYear - 1 < 2002 ? 2026 : graceRasterYear - 1);
+  }, [graceRasterYear, prefetchYear]);
+
+  // Cleanup interval on unmount
+  useEffect(() => () => { if (playIntervalRef.current) clearInterval(playIntervalRef.current); }, []);
 
   // Convert raw fetch/HTTP errors into user-friendly messages
   function friendlyError(e: any): string {
@@ -661,7 +739,8 @@ export default function GraceExplorer() {
   useEffect(() => {
     if (!mapRef.current || leafletMap.current) return;
 
-    const map = L.map(mapRef.current, { center: [20, 0], zoom: 2, zoomControl: true });
+    const map = L.map(mapRef.current, { center: [20, 0], zoom: 2, zoomControl: false });
+    L.control.zoom({ position: "topright" }).addTo(map);
     L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}", {
       attribution: 'Tiles &copy; <a href="https://www.esri.com/">Esri</a> &mdash; Esri, DeLorme, NAVTEQ, TomTom, Intermap, iPC, USGS, FAO, NPS, NRCAN, GeoBase, Kadaster NL, Ordnance Survey, Esri Japan, METI, Esri China (Hong Kong), and the GIS User Community',
       maxZoom: 19,
@@ -1283,7 +1362,7 @@ export default function GraceExplorer() {
             </span>
           </div>
 
-          {/* GRACE RASTER OVERLAY CONTROLS */}
+          {/* GRACE RASTER OVERLAY CONTROLS — legend only (opacity/year in floating timeline) */}
           <div style={{ display: "flex", alignItems: "center", gap: 7, flexShrink: 0 }}>
             {/* GRACE satellite icon */}
             <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
@@ -1295,17 +1374,6 @@ export default function GraceExplorer() {
               <line x1="11" y1="7" x2="13" y2="7" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
             </svg>
             <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>GRACE</span>
-            {/* Opacity/saturation slider */}
-            <input
-              type="range" min={0} max={100} step={5}
-              value={Math.round(graceRasterOpacity * 100)}
-              onChange={(e) => setGraceRasterOpacity(Number(e.target.value) / 100)}
-              title={`GRACE raster opacity: ${Math.round(graceRasterOpacity * 100)}%`}
-              style={{ width: 72, accentColor: "#f59e0b", cursor: "pointer" }}
-            />
-            <span style={{ fontSize: "10px", color: graceRasterOpacity > 0 ? "#f59e0b" : "#484f58", fontFamily: "monospace", width: 28, textAlign: "right" }}>
-              {graceRasterOpacity > 0 ? `${Math.round(graceRasterOpacity * 100)}%` : "off"}
-            </span>
             {/* Diverging color legend — Red=Loss(left/neg) → White=0 → Blue=Gain(right/pos) */}
             <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, marginLeft: 2 }}>
               {/* Left label: lo value (negative = Loss = red side) */}
@@ -1662,36 +1730,136 @@ export default function GraceExplorer() {
         <div style={{ position: "absolute", top: HDR_H, left: TC_PANEL_W, width: mapW, height: bodyH, overflow: "hidden" }}>
           <div ref={mapRef} style={{ width: "100%", height: "100%" }} data-testid="map-container"/>
 
-          {/* ── GRACE YEAR TIMELINE SLIDER — floats at top of map ── */}
+          {/* ── GRACE YEAR TIMELINE + PLAYBACK CONTROLS — floats at top-center of map ── */}
           <div style={{
-            position: "absolute", top: 8, left: 12, right: 12, zIndex: 450,
-            background: "rgba(13,17,23,0.88)",
+            position: "absolute", top: 8, left: 64, right: 64, zIndex: 450,
+            background: "rgba(13,17,23,0.92)",
             border: "1px solid #f59e0b50",
             borderRadius: 8,
-            padding: "6px 14px 7px",
-            backdropFilter: "blur(4px)",
-            boxShadow: "0 2px 10px rgba(0,0,0,0.5)",
+            padding: "7px 14px 6px",
+            backdropFilter: "blur(6px)",
+            boxShadow: "0 2px 12px rgba(0,0,0,0.55)",
             pointerEvents: "auto",
           }}>
-            {/* Header row: label + current year */}
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
-              <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 700 }}>GRACE LWE Year</span>
-              <span style={{ fontSize: "13px", fontWeight: 700, fontFamily: "monospace", color: "#f59e0b", letterSpacing: "0.05em" }}>{graceRasterYear}</span>
+
+            {/* ROW 1: Playback controls + year label */}
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
+
+              {/* Prev year button */}
+              <button
+                onClick={() => stepYear(-1)}
+                title="Previous year"
+                style={{
+                  background: "none", border: "1px solid #f59e0b60", borderRadius: 4,
+                  color: "#f59e0b", cursor: "pointer", padding: "2px 6px",
+                  fontSize: 13, lineHeight: 1, flexShrink: 0,
+                  display: "flex", alignItems: "center",
+                }}
+              >◀</button>
+
+              {/* Play / Pause button */}
+              <button
+                onClick={togglePlay}
+                title={isPlaying ? "Pause animation" : "Play through years 2002–2026"}
+                style={{
+                  background: isPlaying ? "#7c3a0080" : "#7c5a0060",
+                  border: `1px solid ${isPlaying ? "#f59e0b" : "#f59e0b80"}`,
+                  borderRadius: 4, color: "#f59e0b", cursor: "pointer",
+                  padding: "2px 10px", fontSize: 13, lineHeight: 1, flexShrink: 0,
+                  display: "flex", alignItems: "center", gap: 4,
+                  boxShadow: isPlaying ? "0 0 6px #f59e0b50" : "none",
+                  transition: "all 0.15s",
+                }}
+              >
+                {isPlaying ? (
+                  <>
+                    <svg width="10" height="10" viewBox="0 0 10 10" fill="#f59e0b">
+                      <rect x="1" y="1" width="3" height="8" rx="0.5"/>
+                      <rect x="6" y="1" width="3" height="8" rx="0.5"/>
+                    </svg>
+                    Pause
+                  </>
+                ) : (
+                  <>
+                    <svg width="10" height="10" viewBox="0 0 10 10" fill="#f59e0b">
+                      <polygon points="1,0.5 9.5,5 1,9.5"/>
+                    </svg>
+                    Play
+                  </>
+                )}
+              </button>
+
+              {/* Next year button */}
+              <button
+                onClick={() => stepYear(1)}
+                title="Next year"
+                style={{
+                  background: "none", border: "1px solid #f59e0b60", borderRadius: 4,
+                  color: "#f59e0b", cursor: "pointer", padding: "2px 6px",
+                  fontSize: 13, lineHeight: 1, flexShrink: 0,
+                  display: "flex", alignItems: "center",
+                }}
+              >▶</button>
+
+              {/* Divider */}
+              <div style={{ width: 1, height: 18, background: "#30363d", flexShrink: 0, margin: "0 2px" }}/>
+
+              {/* FPS input */}
+              <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, whiteSpace: "nowrap" }}>FPS</span>
+                <input
+                  type="number"
+                  min={0.1} max={10} step={0.5}
+                  value={playFps}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (!isNaN(v) && v > 0) setPlayFps(v);
+                  }}
+                  title="Playback speed in frames per second"
+                  style={{
+                    width: 44, padding: "1px 4px", fontSize: "11px", fontFamily: "monospace",
+                    background: "#0d1117", border: "1px solid #f59e0b60", borderRadius: 4,
+                    color: "#f59e0b", outline: "none", textAlign: "center",
+                  }}
+                />
+              </div>
+
+              {/* Divider */}
+              <div style={{ width: 1, height: 18, background: "#30363d", flexShrink: 0, margin: "0 2px" }}/>
+
+              {/* Opacity control (inline, compact) */}
+              <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, whiteSpace: "nowrap" }}>Opacity</span>
+                <input
+                  type="range" min={0} max={100} step={5}
+                  value={Math.round(graceRasterOpacity * 100)}
+                  onChange={(e) => setGraceRasterOpacity(Number(e.target.value) / 100)}
+                  title={`GRACE raster opacity: ${Math.round(graceRasterOpacity * 100)}%`}
+                  style={{ width: 64, accentColor: "#f59e0b", cursor: "pointer" }}
+                />
+                <span style={{ fontSize: "10px", color: graceRasterOpacity > 0 ? "#f59e0b" : "#484f58", fontFamily: "monospace", width: 28, flexShrink: 0 }}>
+                  {graceRasterOpacity > 0 ? `${Math.round(graceRasterOpacity * 100)}%` : "off"}
+                </span>
+              </div>
+
+              {/* Year badge — pushed to right */}
+              <div style={{ marginLeft: "auto", display: "flex", alignItems: "baseline", gap: 4, flexShrink: 0 }}>
+                <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>GRACE LWE</span>
+                <span style={{ fontSize: "15px", fontWeight: 700, fontFamily: "monospace", color: "#f59e0b" }}>{graceRasterYear}</span>
+              </div>
             </div>
-            {/* Slider row */}
+
+            {/* ROW 2: Timeline slider */}
             <div style={{ position: "relative" }}>
               <input
                 type="range"
                 min={2002} max={2026} step={1}
                 value={graceRasterYear}
-                onChange={(e) => setGraceRasterYear(Number(e.target.value))}
+                onChange={(e) => { stopPlayback(); setGraceRasterYear(Number(e.target.value)); }}
                 title={`GRACE LWE year: ${graceRasterYear}`}
-                style={{
-                  width: "100%", accentColor: "#f59e0b", cursor: "pointer",
-                  height: 4, margin: 0,
-                }}
+                style={{ width: "100%", accentColor: "#f59e0b", cursor: "pointer", height: 4, margin: 0, display: "block" }}
               />
-              {/* Year tick marks */}
+              {/* Year tick marks every 3 years */}
               <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, pointerEvents: "none" }}>
                 {[2002, 2005, 2008, 2011, 2014, 2017, 2020, 2023, 2026].map(y => (
                   <span key={y} style={{
