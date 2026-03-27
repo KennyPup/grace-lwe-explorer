@@ -80,6 +80,9 @@ export default function GraceExplorer() {
   const bodyH = size.h - HDR_H - GEO_H;
 
   const [chartMode, setChartMode] = useState<ChartMode>("annual");
+  // Splash screen — shown once per session, dismissed by button
+  const [showSplash, setShowSplash] = useState(true);
+
   const [drawMode, setDrawMode] = useState<DrawMode>("point");
   const [rectStep, setRectStep] = useState<0 | 1>(0);
   const [pendingQuery, setPendingQuery] = useState<{ type: "point" | "bbox"; params: Record<string, number> } | null>(null);
@@ -1217,6 +1220,112 @@ export default function GraceExplorer() {
 
   return (
     <>
+      {/* ── SPLASH SCREEN ──────────────────────────────────────────────────── */}
+      {showSplash && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 9999,
+          background: "rgba(5, 8, 14, 0.82)",
+          backdropFilter: "blur(6px)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          animation: "splashOverlayIn 0.4s ease both",
+          fontFamily: "'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif",
+        }}>
+          <div style={{
+            background: "#ffffff",
+            borderRadius: 12,
+            boxShadow: "0 24px 80px rgba(0,0,0,0.55), 0 4px 16px rgba(0,0,0,0.3)",
+            padding: "40px 44px 36px",
+            maxWidth: 580,
+            width: "calc(100% - 48px)",
+            animation: "splashFadeIn 0.45s cubic-bezier(0.22,1,0.36,1) 0.05s both",
+          }}>
+            {/* Header */}
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 22 }}>
+              {/* Satellite icon */}
+              <div style={{
+                width: 44, height: 44, borderRadius: 10,
+                background: "linear-gradient(135deg, #1a1f2e 60%, #2d3550)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                flexShrink: 0,
+              }}>
+                <svg viewBox="0 0 24 24" width="24" height="24" fill="none">
+                  <circle cx="12" cy="12" r="9" stroke="#f59e0b" strokeWidth="1.6"/>
+                  <circle cx="12" cy="12" r="3.5" fill="#f59e0b" fillOpacity="0.7"/>
+                  <line x1="12" y1="2" x2="12" y2="5.5" stroke="#f59e0b" strokeWidth="1.5" strokeLinecap="round"/>
+                  <line x1="12" y1="18.5" x2="12" y2="22" stroke="#f59e0b" strokeWidth="1.5" strokeLinecap="round"/>
+                  <line x1="2" y1="12" x2="5.5" y2="12" stroke="#f59e0b" strokeWidth="1.5" strokeLinecap="round"/>
+                  <line x1="18.5" y1="12" x2="22" y2="12" stroke="#f59e0b" strokeWidth="1.5" strokeLinecap="round"/>
+                </svg>
+              </div>
+              <div>
+                <div style={{ fontSize: "9px", fontWeight: 700, letterSpacing: "0.14em", textTransform: "uppercase", color: "#6b7280", marginBottom: 3 }}>Environmental Analysis Tool</div>
+                <h1 style={{ margin: 0, fontSize: "20px", fontWeight: 700, color: "#0f172a", letterSpacing: "-0.02em", lineHeight: 1.2 }}>
+                  GRACE-TC-Geology Explorer
+                </h1>
+              </div>
+            </div>
+
+            {/* Divider */}
+            <div style={{ height: 1, background: "#e5e7eb", marginBottom: 20 }}/>
+
+            {/* Body */}
+            <p style={{ margin: "0 0 14px", fontSize: "13.5px", lineHeight: 1.65, color: "#374151", fontWeight: 400 }}>
+              This is a multi-purpose tool for regional and local environmental analysis:
+            </p>
+            <ul style={{ margin: "0 0 16px", padding: "0 0 0 18px", fontSize: "13.5px", lineHeight: 1.75, color: "#374151" }}>
+              <li style={{ marginBottom: 8 }}>
+                <strong style={{ color: "#0f172a" }}>General Geology &amp; Hydrogeology:</strong>{" "}
+                Use the map to explore structural features and aquifer frameworks.
+              </li>
+              <li style={{ marginBottom: 8 }}>
+                <strong style={{ color: "#0f172a" }}>GRACE Data:</strong>{" "}
+                Visualize and download terrestrial water storage anomalies. Use this to set the broad regional context across large areas.
+              </li>
+              <li>
+                <strong style={{ color: "#0f172a" }}>TerraClimate Data:</strong>{" "}
+                Access high-resolution climate variables (Precipitation, Runoff, Soil Moisture, and Groundwater Runoff&#x202F;&#x2014;&#x202F;baseflow).
+              </li>
+            </ul>
+
+            {/* Usage tip box */}
+            <div style={{
+              background: "#fffbeb",
+              border: "1px solid #fcd34d",
+              borderLeft: "4px solid #f59e0b",
+              borderRadius: 6,
+              padding: "11px 14px",
+              marginBottom: 28,
+            }}>
+              <div style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "#92400e", marginBottom: 5 }}>Usage Tip</div>
+              <p style={{ margin: 0, fontSize: "13px", lineHeight: 1.6, color: "#78350f" }}>
+                Because TerraClimate data is significantly more granular, please restrict TC queries to a specific study area (AOI).
+                Use the broader GRACE data to establish the regional hydrogeologic context before diving into the local TC analysis.
+              </p>
+            </div>
+
+            {/* Proceed button */}
+            <button
+              onClick={() => setShowSplash(false)}
+              style={{
+                display: "block", width: "100%",
+                padding: "13px 0",
+                background: "linear-gradient(135deg, #1e3a5f 0%, #0f2744 100%)",
+                color: "#ffffff",
+                fontSize: "14px", fontWeight: 600, letterSpacing: "0.04em",
+                border: "none", borderRadius: 8, cursor: "pointer",
+                fontFamily: "inherit",
+                boxShadow: "0 4px 16px rgba(15,39,68,0.35)",
+                transition: "transform 0.12s, box-shadow 0.12s",
+              }}
+              onMouseEnter={e => { (e.target as HTMLButtonElement).style.transform = "translateY(-1px)"; (e.target as HTMLButtonElement).style.boxShadow = "0 6px 20px rgba(15,39,68,0.45)"; }}
+              onMouseLeave={e => { (e.target as HTMLButtonElement).style.transform = ""; (e.target as HTMLButtonElement).style.boxShadow = "0 4px 16px rgba(15,39,68,0.35)"; }}
+            >
+              Proceed to Explorer →
+            </button>
+          </div>
+        </div>
+      )}
+
       <style>{`
         html, body, #root {
           width: 100% !important; height: 100% !important;
@@ -1225,6 +1334,8 @@ export default function GraceExplorer() {
         }
         @keyframes spin { to { transform: rotate(360deg); } }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+        @keyframes splashFadeIn { from { opacity:0; transform:translateY(-12px); } to { opacity:1; transform:translateY(0); } }
+        @keyframes splashOverlayIn { from { opacity:0; } to { opacity:1; } }
         .leaflet-bar a {
           background-color: #161b22 !important;
           border-color: #30363d !important;
