@@ -1295,21 +1295,6 @@ export default function GraceExplorer() {
               <line x1="11" y1="7" x2="13" y2="7" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
             </svg>
             <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>GRACE</span>
-            {/* Year selector */}
-            <select
-              value={graceRasterYear}
-              onChange={(e) => setGraceRasterYear(Number(e.target.value))}
-              title="GRACE LWE overlay year"
-              style={{
-                height: 26, padding: "0 4px", fontSize: "11px", fontFamily: "monospace",
-                background: "#0d1117", border: "1px solid #f59e0b60", borderRadius: 4,
-                color: "#f59e0b", cursor: "pointer", outline: "none",
-              }}
-            >
-              {Array.from({ length: 2026 - 2002 + 1 }, (_, i) => 2002 + i).map(y => (
-                <option key={y} value={y}>{y}</option>
-              ))}
-            </select>
             {/* Opacity/saturation slider */}
             <input
               type="range" min={0} max={100} step={5}
@@ -1676,6 +1661,49 @@ export default function GraceExplorer() {
         {/* ── MAP ── */}
         <div style={{ position: "absolute", top: HDR_H, left: TC_PANEL_W, width: mapW, height: bodyH, overflow: "hidden" }}>
           <div ref={mapRef} style={{ width: "100%", height: "100%" }} data-testid="map-container"/>
+
+          {/* ── GRACE YEAR TIMELINE SLIDER — floats at top of map ── */}
+          <div style={{
+            position: "absolute", top: 8, left: 12, right: 12, zIndex: 450,
+            background: "rgba(13,17,23,0.88)",
+            border: "1px solid #f59e0b50",
+            borderRadius: 8,
+            padding: "6px 14px 7px",
+            backdropFilter: "blur(4px)",
+            boxShadow: "0 2px 10px rgba(0,0,0,0.5)",
+            pointerEvents: "auto",
+          }}>
+            {/* Header row: label + current year */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+              <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 700 }}>GRACE LWE Year</span>
+              <span style={{ fontSize: "13px", fontWeight: 700, fontFamily: "monospace", color: "#f59e0b", letterSpacing: "0.05em" }}>{graceRasterYear}</span>
+            </div>
+            {/* Slider row */}
+            <div style={{ position: "relative" }}>
+              <input
+                type="range"
+                min={2002} max={2026} step={1}
+                value={graceRasterYear}
+                onChange={(e) => setGraceRasterYear(Number(e.target.value))}
+                title={`GRACE LWE year: ${graceRasterYear}`}
+                style={{
+                  width: "100%", accentColor: "#f59e0b", cursor: "pointer",
+                  height: 4, margin: 0,
+                }}
+              />
+              {/* Year tick marks */}
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, pointerEvents: "none" }}>
+                {[2002, 2005, 2008, 2011, 2014, 2017, 2020, 2023, 2026].map(y => (
+                  <span key={y} style={{
+                    fontSize: "8px", fontFamily: "monospace",
+                    color: y === graceRasterYear ? "#f59e0b" : "#484f58",
+                    fontWeight: y === graceRasterYear ? 700 : 400,
+                    transition: "color 0.1s",
+                  }}>{y}</span>
+                ))}
+              </div>
+            </div>
+          </div>
 
           {/* ── FLOATING HYDROLOGY PANEL (bottom-left of map) ── */}
           <div style={{
