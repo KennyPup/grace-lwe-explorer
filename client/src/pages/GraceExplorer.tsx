@@ -65,13 +65,15 @@ async function geocode(query: string): Promise<{ lat: number; lon: number; displ
 // component type and never unmounts/remounts it during parent re-renders.
 // Props are computed from tcResult+tcChartMode only — NOT from tcMapMonth/tcMapVar.
 const TCBarChartStatic = memo(function TCBarChartStatic({
-  data, color, label, interval, maxBarSize
+  data, color, label, interval, maxBarSize, activeMonth, onMonthClick
 }: {
   data: { label: string; value: number | null }[];
   color: string;
   label: string;
   interval: number;
   maxBarSize: number;
+  activeMonth?: number;
+  onMonthClick?: (monthIdx: number) => void;
 }) {
   return (
     <div style={{ height: 110, padding: "0 2px 0 0" }}>
@@ -97,7 +99,23 @@ const TCBarChartStatic = memo(function TCBarChartStatic({
             cursor={{ fill: "#21262d" }}
             formatter={(val: number) => [`${val?.toFixed(1)} mm`, label]}
           />
-          <Bar dataKey="value" maxBarSize={maxBarSize} radius={[2, 2, 0, 0]} fill={color} fillOpacity={0.85}/>
+          <Bar
+            dataKey="value"
+            maxBarSize={maxBarSize}
+            radius={[2, 2, 0, 0]}
+            fill={color}
+            fillOpacity={0.85}
+            onClick={onMonthClick ? ((_data: any, index: number) => onMonthClick(index)) : undefined}
+            style={onMonthClick ? { cursor: "pointer" } : undefined}
+          />
+          {activeMonth !== undefined && MONTH_LABELS[activeMonth] && (
+            <ReferenceLine
+              x={MONTH_LABELS[activeMonth]}
+              stroke="#f59e0b"
+              strokeDasharray="4 3"
+              strokeWidth={1.5}
+            />
+          )}
         </BarChart>
       </ResponsiveContainer>
     </div>
@@ -442,12 +460,13 @@ export default function GraceExplorer() {
   useEffect(() => { renderGraceRasterRef.current = renderGraceRaster; }, [renderGraceRaster]);
 
   // ── TC raster renderer ───────────────────────────────────────────────────
-  // Color ramps per variable (light → dark)
+  // Color ramps per variable — light tint → rich bar-chart color → deep shade
+  // Lo = very light tint, Hi = deep shade matching bar chart palette
   const TC_MAP_RAMPS: Record<TCMapVar, [string, string]> = {
-    ppt: ["#E0F3FF", "#004C99"],  // light blue → dark blue
-    aet: ["#FFFFE0", "#8B0000"],  // yellow → dark red
-    q:   ["#E0FFE0", "#006400"],  // light green → dark green
-    bf:  ["#E0FFFF", "#008B8B"],  // light cyan → dark cyan
+    ppt: ["#dbeafe", "#1d4ed8"],  // light blue → deep blue  (bar: #60a5fa)
+    aet: ["#d1fae5", "#065f46"],  // light green → deep green (bar: #34d399)
+    q:   ["#ede9fe", "#5b21b6"],  // light purple → deep purple (bar: #a78bfa)
+    bf:  ["#ffedd5", "#9a3412"],  // light orange → deep orange (bar: #fb923c)
   };
   const TC_MAP_LABELS: Record<TCMapVar, string> = {
     ppt: "Precip", aet: "Actual ET", q: "Runoff", bf: "Baseflow",
@@ -1652,9 +1671,11 @@ export default function GraceExplorer() {
         label={TC_LABELS[varKey]}
         interval={chartInterval}
         maxBarSize={chartMaxBarSize}
+        activeMonth={tcChartMode === "monthly_mean" ? tcMapMonth : undefined}
+        onMonthClick={tcChartMode === "monthly_mean" ? (idx: number) => { stopTCPlayback(); setTcMapMonth(idx); } : undefined}
       />
     ),
-    [stableTCChartData, chartInterval, chartMaxBarSize]
+    [stableTCChartData, chartInterval, chartMaxBarSize, tcChartMode, tcMapMonth, stopTCPlayback, setTcMapMonth]
   );
 
   return (
@@ -1915,42 +1936,77 @@ export default function GraceExplorer() {
           {/* RASTER LEGEND (adapts to active overlay: GRACE or TC variable) */}
           <div style={{ display: "flex", alignItems: "center", gap: 7, flexShrink: 0 }}>
             {tcMapVar ? (
-              // TC variable legend
-              <>
-                <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
-                  <path d="M8 2C4.13 2 1 5.13 1 9s3.13 7 7 7 7-3.13 7-7-3.13-7-7-7z" stroke="#60a5fa" strokeWidth="1.3"/>
-                  <path d="M5 9c0-1.66 1.34-3 3-3s3 1.34 3 3" stroke="#34d399" strokeWidth="1.3" strokeLinecap="round"/>
-                </svg>
-                <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>
-                  {TC_MAP_LABELS[tcMapVar]}
-                </span>
-                {/* Sequential color ramp: light → dark */}
-                {(() => {
-                  const [loHex, hiHex] = TC_MAP_RAMPS[tcMapVar];
-                  const tcVals = tcMapVar === "bf"
-                    ? baseflowMeans.filter((v): v is number => v !== null)
-                    : (tcResult?.variables?.[tcMapVar as "ppt"|"aet"|"q"]?.monthly_means ?? []).filter((v): v is number => v !== null);
-                  const mn = tcVals.length > 0 ? Math.min(...tcVals) : 0;
-                  const mx = tcVals.length > 0 ? Math.max(...tcVals) : 0;
-                  return (
+              // TC variable legend — label + color ramp + spatial min/max
+              (() => {
+                const [loHex, hiHex] = TC_MAP_RAMPS[tcMapVar];
+                const varColor = TC_COLORS[tcMapVar];
+
+                // Compute spatial min/max: prefer spatial_grid all-pixel range
+                // (mirrors what renderTCRaster uses for its color stretch)
+                let tcMin = 0, tcMax = 0;
+                if (tcResult) {
+                  let allVals: number[] = [];
+                  for (let m = 0; m < 12; m++) {
+                    let grid: (number | null)[][] | null = null;
+                    if (tcMapVar === "bf") {
+                      const pG = tcResult.variables.ppt.spatial_grid;
+                      const aG = tcResult.variables.aet.spatial_grid;
+                      const qG = tcResult.variables.q.spatial_grid;
+                      if (pG?.[m] && aG?.[m] && qG?.[m]) {
+                        grid = pG[m].map((row, r) =>
+                          row.map((p, c) => {
+                            const a = aG![m][r]?.[c] ?? null;
+                            const q = qG![m][r]?.[c] ?? null;
+                            return (p !== null && a !== null && q !== null) ? Math.max(0, p - a - q) : null;
+                          })
+                        );
+                      }
+                    } else {
+                      grid = tcResult.variables[tcMapVar as "ppt"|"aet"|"q"].spatial_grid?.[m] ?? null;
+                    }
+                    if (grid) {
+                      for (const row of grid) for (const v of row) { if (v !== null) allVals.push(v); }
+                    }
+                  }
+                  // Fallback to monthly_means if no spatial data
+                  if (allVals.length === 0) {
+                    allVals = tcMapVar === "bf"
+                      ? baseflowMeans.filter((v): v is number => v !== null)
+                      : (tcResult.variables[tcMapVar as "ppt"|"aet"|"q"].monthly_means ?? []).filter((v): v is number => v !== null);
+                  }
+                  tcMin = allVals.length > 0 ? Math.min(...allVals) : 0;
+                  tcMax = allVals.length > 0 ? Math.max(...allVals) : 0;
+                }
+
+                return (
+                  <>
+                    <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
+                      <rect x="1" y="1" width="12" height="12" rx="2" stroke={varColor} strokeWidth="1.3"/>
+                      <line x1="4" y1="11" x2="4" y2="5" stroke={varColor} strokeWidth="1.8" strokeLinecap="round"/>
+                      <line x1="7" y1="11" x2="7" y2="3" stroke={varColor} strokeWidth="1.8" strokeLinecap="round"/>
+                      <line x1="10" y1="11" x2="10" y2="7" stroke={varColor} strokeWidth="1.8" strokeLinecap="round"/>
+                    </svg>
+                    <span style={{ fontSize: "10px", color: varColor, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700, transition: "color 0.2s" }}>
+                      {TC_MAP_LABELS[tcMapVar]}
+                    </span>
                     <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, marginLeft: 2 }}>
                       <span style={{ fontSize: "8px", color: "#8b949e", fontFamily: "monospace", lineHeight: 1, textAlign: "right", minWidth: 28 }}>
-                        {mn.toFixed(0)}
+                        {tcMin.toFixed(0)}
                       </span>
                       <div style={{
                         width: 52, height: 10, borderRadius: 3,
                         background: `linear-gradient(to right, ${loHex}, ${hiHex})`,
-                        border: "1px solid #60a5fa60",
-                        boxShadow: "0 0 4px #60a5fa30",
+                        border: `1px solid ${varColor}60`,
+                        boxShadow: `0 0 4px ${varColor}30`,
                       }}/>
                       <span style={{ fontSize: "8px", color: "#8b949e", fontFamily: "monospace", lineHeight: 1, minWidth: 28 }}>
-                        {mx.toFixed(0)}
+                        {tcMax.toFixed(0)}
                       </span>
-                      <span style={{ fontSize: "7px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1 }}>mm</span>
+                      <span style={{ fontSize: "7px", color: varColor, fontFamily: "monospace", lineHeight: 1 }}>mm</span>
                     </div>
-                  );
-                })()}
-              </>
+                  </>
+                );
+              })()
             ) : (
               // GRACE LWE diverging legend
               <>
@@ -2424,7 +2480,7 @@ export default function GraceExplorer() {
           ═══════════════════════════════════════════════════════════════ */}
           {tcResult && (
             <div style={{
-              position: "absolute", bottom: 8, left: 54, right: 54, zIndex: 450,
+              position: "absolute", bottom: 36, left: 54, right: 54, zIndex: 450,
               background: "rgba(13,17,23,0.93)",
               border: `1px solid ${tcMapVar ? "#60a5fa60" : "#30363d"}`,
               borderRadius: 8,
