@@ -17,6 +17,7 @@ L.Icon.Default.mergeOptions({ iconRetinaUrl: markerIcon2x, iconUrl: markerIcon, 
 
 type ChartMode = "monthly" | "annual";
 type DrawMode = "point" | "rect";
+type TCMapVar = "ppt" | "aet" | "q" | "bf";
 type StatusData = { loaded: boolean; loadError: string | null; loadProgress: string; nTimes: number };
 type SeriesPoint = { date?: string; lwe: number | null; year?: number };
 interface QueryResult {
@@ -99,6 +100,20 @@ export default function GraceExplorer() {
   const [tcLoading, setTcLoading] = useState(false);
   const [tcError, setTcError] = useState<string | null>(null);
   const [tcChartMode, setTcChartMode] = useState<"annual" | "monthly_series" | "monthly_mean">("annual");
+
+  // TC map overlay state
+  const [tcMapVar, setTcMapVar] = useState<TCMapVar | null>(null);
+  const [tcMapMonth, setTcMapMonth] = useState(0); // 0=Jan..11=Dec
+  const tcImageOverlayRef = useRef<L.ImageOverlay | null>(null);
+  const tcMapVarRef = useRef<TCMapVar | null>(null);
+  const tcMapMonthRef = useRef(0);
+  useEffect(() => { tcMapVarRef.current = tcMapVar; }, [tcMapVar]);
+  useEffect(() => { tcMapMonthRef.current = tcMapMonth; }, [tcMapMonth]);
+  // tcResultRef: stable ref to latest tcResult so renderTCRaster can read it without stale closure
+  const tcResultRef = useRef<TCResult | null>(null);
+  useEffect(() => { tcResultRef.current = tcResult; }, [tcResult]);
+  // baseflowMeansRef: stable ref for animation
+  const baseflowMeansRef = useRef<(number | null)[]>(Array(12).fill(null));
 
   // Geology state
   const [geoSummary, setGeoSummary] = useState<string | null>(null);
@@ -253,7 +268,7 @@ export default function GraceExplorer() {
       return;
     }
 
-    const API_BASE_R = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+    const API_BASE_R = "";
     try {
       // ── Fetch or use cached grid ─────────────────────────────────────────
       let grid = graceGridCacheRef.current[year];
@@ -356,11 +371,158 @@ export default function GraceExplorer() {
   const renderGraceRasterRef = useRef(renderGraceRaster);
   useEffect(() => { renderGraceRasterRef.current = renderGraceRaster; }, [renderGraceRaster]);
 
+  // ── TC raster renderer ───────────────────────────────────────────────────
+  // Color ramps per variable (light → dark)
+  const TC_MAP_RAMPS: Record<TCMapVar, [string, string]> = {
+    ppt: ["#E0F3FF", "#004C99"],  // light blue → dark blue
+    aet: ["#FFFFE0", "#8B0000"],  // yellow → dark red
+    q:   ["#E0FFE0", "#006400"],  // light green → dark green
+    bf:  ["#E0FFFF", "#008B8B"],  // light cyan → dark cyan
+  };
+  const TC_MAP_LABELS: Record<TCMapVar, string> = {
+    ppt: "Precip", aet: "Actual ET", q: "Runoff", bf: "Baseflow",
+  };
+
+  // Parse hex color → [r,g,b]
+  function hexToRgb(hex: string): [number, number, number] {
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return [r, g, b];
+  }
+
+  // Render TC monthly-mean raster for the given variable and month index
+  // Uses bilinear upscaling: paint a small (pixel-count) canvas then upscale to a large canvas
+  // for smooth transitions between 4km TC pixels.
+  const renderTCRaster = useCallback(async (varKey: TCMapVar, monthIdx: number) => {
+    if (!leafletMap.current) return;
+
+    const aoi = graceAoiRef.current;
+    const tc = tcResultRef.current;
+    if (!aoi || !tc) {
+      if (tcImageOverlayRef.current) { tcImageOverlayRef.current.remove(); tcImageOverlayRef.current = null; }
+      return;
+    }
+
+    // ── Get the 12 monthly-mean values for the selected variable ─────────
+    let means: (number | null)[];
+    if (varKey === "bf") {
+      means = baseflowMeansRef.current;
+    } else {
+      means = tc.variables[varKey].monthly_means;
+    }
+
+    const val = means[monthIdx];
+    if (val === null || val === undefined) return;
+
+    // ── Stretch: min/max across all 12 months ────────────────────────────
+    const allVals = means.filter((v): v is number => v !== null);
+    if (allVals.length === 0) return;
+    const mn = Math.min(...allVals);
+    const mx = Math.max(...allVals);
+    const range = mx - mn;
+
+    // ── Color interpolation ──────────────────────────────────────────────
+    const [loHex, hiHex] = TC_MAP_RAMPS[varKey];
+    const [loR, loG, loB] = hexToRgb(loHex);
+    const [hiR, hiG, hiB] = hexToRgb(hiHex);
+
+    const colorForValue = (v: number): [number, number, number] => {
+      const t = range < 0.001 ? 0.5 : Math.max(0, Math.min(1, (v - mn) / range));
+      return [
+        Math.round(loR + t * (hiR - loR)),
+        Math.round(loG + t * (hiG - loG)),
+        Math.round(loB + t * (hiB - loB)),
+      ];
+    };
+
+    // ── TC grid specs: 1/24° ≈ 0.04167° per pixel ────────────────────────
+    // For a bbox AOI: the TC backend returns the SPATIAL MEAN across the region,
+    // stored as a single scalar per month in monthly_means.  So the overlay is
+    // a uniform-color rectangle for that month — we still upscale it for smooth edges.
+    // For a point AOI: same single-value per month.
+    const TC_STEP = 1 / 24; // °
+
+    // Determine the TC pixel bounds snapped to the AOI
+    const tcColMin = Math.floor(aoi.minLon / TC_STEP);
+    const tcColMax = Math.ceil(aoi.maxLon  / TC_STEP);
+    const tcRowMin = Math.floor(aoi.minLat / TC_STEP);
+    const tcRowMax = Math.ceil(aoi.maxLat  / TC_STEP);
+
+    const tcCols = Math.max(1, tcColMax - tcColMin);
+    const tcRows = Math.max(1, tcRowMax - tcRowMin);
+
+    // ── Paint small source canvas (1px per TC cell) ──────────────────────
+    // Since TC monthly_means returns a single scalar (spatial mean), all cells
+    // have the same value — but we still build the grid for future extensibility
+    // and so the bilinear upscale edge-smoothing works properly.
+    const [r, g, b] = colorForValue(val);
+
+    const srcCanvas = document.createElement('canvas');
+    srcCanvas.width  = Math.max(1, tcCols);
+    srcCanvas.height = Math.max(1, tcRows);
+    const srcCtx = srcCanvas.getContext('2d')!;
+    const srcData = srcCtx.createImageData(srcCanvas.width, srcCanvas.height);
+    for (let i = 0; i < srcData.data.length; i += 4) {
+      srcData.data[i]   = r;
+      srcData.data[i+1] = g;
+      srcData.data[i+2] = b;
+      srcData.data[i+3] = 220; // slight transparency
+    }
+    srcCtx.putImageData(srcData, 0, 0);
+
+    // ── Upscale to a larger canvas with bilinear smoothing ───────────────
+    // Target: ~6x upscale so the 4km pixels look smooth at map zoom levels
+    const SCALE = 6;
+    const dstCanvas = document.createElement('canvas');
+    dstCanvas.width  = srcCanvas.width  * SCALE;
+    dstCanvas.height = srcCanvas.height * SCALE;
+    const dstCtx = dstCanvas.getContext('2d', { willReadFrequently: true })!;
+    dstCtx.imageSmoothingEnabled = true;
+    dstCtx.imageSmoothingQuality = 'high';
+    dstCtx.drawImage(srcCanvas, 0, 0, dstCanvas.width, dstCanvas.height);
+
+    const dataUrl = dstCanvas.toDataURL('image/png');
+
+    // ── Geographic bounds for the overlay (AOI bbox) ─────────────────────
+    const imgSouth = aoi.minLat;
+    const imgNorth = aoi.maxLat;
+    const imgWest  = aoi.minLon;
+    const imgEast  = aoi.maxLon;
+
+    // ── Place Leaflet ImageOverlay ────────────────────────────────────────
+    if (tcImageOverlayRef.current) tcImageOverlayRef.current.remove();
+    const overlay = L.imageOverlay(dataUrl, [[imgSouth, imgWest], [imgNorth, imgEast]], {
+      opacity: 0.75,
+      zIndex: 196, // above GRACE (195) so TC is visible on top
+      interactive: false,
+      className: 'tc-raster-overlay',
+    });
+    overlay.addTo(leafletMap.current);
+    tcImageOverlayRef.current = overlay;
+
+    // Keep AOI / rivers on top
+    if (aoiLayerRef.current) aoiLayerRef.current.bringToFront();
+    if (riversLayerRef.current) riversLayerRef.current.bringToFront();
+  }, []); // all state read via refs — no stale closures
+
+  const renderTCRasterRef = useRef(renderTCRaster);
+  useEffect(() => { renderTCRasterRef.current = renderTCRaster; }, [renderTCRaster]);
+
+  // Re-render TC raster whenever variable or month changes (and tcResult is available)
+  useEffect(() => {
+    if (!tcMapVar || !tcResult) {
+      if (tcImageOverlayRef.current) { tcImageOverlayRef.current.remove(); tcImageOverlayRef.current = null; }
+      return;
+    }
+    renderTCRasterRef.current(tcMapVar, tcMapMonth);
+  }, [tcMapVar, tcMapMonth, tcResult]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Background pre-fetch: silently cache grids for adjacent years ───────────────────
   const prefetchYear = useCallback(async (year: number) => {
     if (year < 2002 || year > 2026) return;
     if (graceGridCacheRef.current[year]) return; // already cached
-    const API_BASE_P = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+    const API_BASE_P = "";
     try {
       const resp = await fetch(`${API_BASE_P}/api/grace-raster?year=${year}`);
       if (!resp.ok) return;
@@ -379,13 +541,18 @@ export default function GraceExplorer() {
     if (playIntervalRef.current) clearInterval(playIntervalRef.current);
     setIsPlaying(true);
     playIntervalRef.current = setInterval(() => {
-      setGraceRasterYear(prev => {
-        const next = prev >= 2026 ? 2002 : prev + 1;
-        // Pre-fetch the year after next in background
-        const afterNext = next >= 2026 ? 2002 : next + 1;
-        prefetchYear(afterNext);
-        return next;
-      });
+      if (tcMapVarRef.current) {
+        // TC mode: cycle months 0→11
+        setTcMapMonth(prev => (prev + 1) % 12);
+      } else {
+        // GRACE mode: cycle years 2002→2026
+        setGraceRasterYear(prev => {
+          const next = prev >= 2026 ? 2002 : prev + 1;
+          const afterNext = next >= 2026 ? 2002 : next + 1;
+          prefetchYear(afterNext);
+          return next;
+        });
+      }
     }, Math.round(1000 / playFpsRef.current));
   }, [prefetchYear]);
 
@@ -395,10 +562,15 @@ export default function GraceExplorer() {
 
   const stepYear = useCallback((delta: number) => {
     stopPlayback();
-    setGraceRasterYear(prev => {
-      const n = prev + delta;
-      return n < 2002 ? 2026 : n > 2026 ? 2002 : n;
-    });
+    if (tcMapVarRef.current) {
+      // TC mode: step months
+      setTcMapMonth(prev => ((prev + delta) % 12 + 12) % 12);
+    } else {
+      setGraceRasterYear(prev => {
+        const n = prev + delta;
+        return n < 2002 ? 2026 : n > 2026 ? 2002 : n;
+      });
+    }
   }, [stopPlayback]);
 
   // Restart interval when FPS changes mid-play (keeps speed responsive)
@@ -406,11 +578,15 @@ export default function GraceExplorer() {
     if (!isPlaying) return;
     if (playIntervalRef.current) clearInterval(playIntervalRef.current);
     playIntervalRef.current = setInterval(() => {
-      setGraceRasterYear(prev => {
-        const next = prev >= 2026 ? 2002 : prev + 1;
-        prefetchYear(next >= 2026 ? 2002 : next + 1);
-        return next;
-      });
+      if (tcMapVarRef.current) {
+        setTcMapMonth(prev => (prev + 1) % 12);
+      } else {
+        setGraceRasterYear(prev => {
+          const next = prev >= 2026 ? 2002 : prev + 1;
+          prefetchYear(next >= 2026 ? 2002 : next + 1);
+          return next;
+        });
+      }
     }, Math.round(1000 / Math.max(0.1, playFps)));
     return () => { if (playIntervalRef.current) clearInterval(playIntervalRef.current); };
   }, [playFps, isPlaying, prefetchYear]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -969,7 +1145,7 @@ export default function GraceExplorer() {
   // GeoTIFF export — download zip of annual rasters for the current AOI
   // Must use the same API_BASE proxy prefix that apiRequest uses, otherwise
   // raw fetch() breaks on the deployed Perplexity static site.
-  const API_BASE_TIFF = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+  const API_BASE_TIFF = "";
   const [tiffLoading, setTiffLoading] = useState(false);
   const downloadGeoTIFF = useCallback(async () => {
     if (!queryResult || tiffLoading) return;
@@ -1098,7 +1274,7 @@ export default function GraceExplorer() {
   }, [tcResult, locationName, tcChartMode]);
 
   // TerraClimate GeoTIFF download
-  const API_BASE_TC_TIFF = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+  const API_BASE_TC_TIFF = "";
   const [tcTiffLoading, setTcTiffLoading] = useState(false);
   const downloadTCGeoTIFF = useCallback(async () => {
     if (!tcResult || tcTiffLoading) return;
@@ -1197,6 +1373,8 @@ export default function GraceExplorer() {
       return Math.max(0, p - a - q);
     });
   })();
+  // Keep ref in sync so animation interval can read the latest baseflow values
+  baseflowMeansRef.current = baseflowMeans;
 
   function TCBarChart({ varKey }: { varKey: "ppt" | "aet" | "q" | "bf" }) {
     const data = varKey === "bf"
@@ -1489,46 +1667,83 @@ export default function GraceExplorer() {
             </span>
           </div>
 
-          {/* GRACE RASTER OVERLAY CONTROLS — legend only (opacity/year in floating timeline) */}
+          {/* RASTER LEGEND (adapts to active overlay: GRACE or TC variable) */}
           <div style={{ display: "flex", alignItems: "center", gap: 7, flexShrink: 0 }}>
-            {/* GRACE satellite icon */}
-            <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
-              <circle cx="7" cy="7" r="5.5" stroke="#f59e0b" strokeWidth="1.3"/>
-              <circle cx="7" cy="7" r="2" fill="#f59e0b" fillOpacity="0.6"/>
-              <line x1="7" y1="1" x2="7" y2="3" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
-              <line x1="7" y1="11" x2="7" y2="13" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
-              <line x1="1" y1="7" x2="3" y2="7" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
-              <line x1="11" y1="7" x2="13" y2="7" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
-            </svg>
-            <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>GRACE</span>
-            {/* Diverging color legend — Red=Loss(left/neg) → White=0 → Blue=Gain(right/pos) */}
-            <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, marginLeft: 2 }}>
-              {/* Left label: lo value (negative = Loss = red side) */}
-              <span style={{ fontSize: "8px", color: "#f87171", fontFamily: "monospace", lineHeight: 1, textAlign: "right", minWidth: 30 }}>
-                {graceLegendRange ? (graceLegendRange.lo < 0 ? `−${Math.abs(graceLegendRange.lo).toFixed(1)}` : graceLegendRange.lo.toFixed(1)) : "−"}
-              </span>
-              {/* Gradient bar: red(left/loss) → white(0) → blue(right/gain) */}
-              <div style={{ position: "relative", flexShrink: 0 }}>
-                <div style={{
-                  width: 52, height: 10, borderRadius: 3,
-                  background: "linear-gradient(to right, rgb(255,0,0), rgb(255,255,255), rgb(0,0,255))",
-                  border: `1px solid ${graceLegendRange ? "#f59e0b80" : "#30363d"}`,
-                  boxShadow: graceLegendRange ? "0 0 4px #f59e0b40" : "none",
-                }}/>
-                {/* Centre tick = 0 LWE */}
-                <div style={{
-                  position: "absolute", top: -2, left: "calc(50% - 0.5px)",
-                  width: 1, height: 14, background: "#ffffff80", pointerEvents: "none",
-                }}/>
-              </div>
-              {/* Right label: hi value (positive = Gain = blue side) */}
-              <span style={{ fontSize: "8px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1, minWidth: 30 }}>
-                {graceLegendRange ? `+${graceLegendRange.hi.toFixed(1)}` : "+"}
-              </span>
-              {graceLegendRange && (
-                <span style={{ fontSize: "7px", color: "#f59e0b", fontFamily: "monospace", lineHeight: 1 }}>cm</span>
-              )}
-            </div>
+            {tcMapVar ? (
+              // TC variable legend
+              <>
+                <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
+                  <path d="M8 2C4.13 2 1 5.13 1 9s3.13 7 7 7 7-3.13 7-7-3.13-7-7-7z" stroke="#60a5fa" strokeWidth="1.3"/>
+                  <path d="M5 9c0-1.66 1.34-3 3-3s3 1.34 3 3" stroke="#34d399" strokeWidth="1.3" strokeLinecap="round"/>
+                </svg>
+                <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>
+                  {TC_MAP_LABELS[tcMapVar]}
+                </span>
+                {/* Sequential color ramp: light → dark */}
+                {(() => {
+                  const [loHex, hiHex] = TC_MAP_RAMPS[tcMapVar];
+                  const tcVals = tcMapVar === "bf"
+                    ? baseflowMeans.filter((v): v is number => v !== null)
+                    : (tcResult?.variables?.[tcMapVar as "ppt"|"aet"|"q"]?.monthly_means ?? []).filter((v): v is number => v !== null);
+                  const mn = tcVals.length > 0 ? Math.min(...tcVals) : 0;
+                  const mx = tcVals.length > 0 ? Math.max(...tcVals) : 0;
+                  return (
+                    <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, marginLeft: 2 }}>
+                      <span style={{ fontSize: "8px", color: "#8b949e", fontFamily: "monospace", lineHeight: 1, textAlign: "right", minWidth: 28 }}>
+                        {mn.toFixed(0)}
+                      </span>
+                      <div style={{
+                        width: 52, height: 10, borderRadius: 3,
+                        background: `linear-gradient(to right, ${loHex}, ${hiHex})`,
+                        border: "1px solid #60a5fa60",
+                        boxShadow: "0 0 4px #60a5fa30",
+                      }}/>
+                      <span style={{ fontSize: "8px", color: "#8b949e", fontFamily: "monospace", lineHeight: 1, minWidth: 28 }}>
+                        {mx.toFixed(0)}
+                      </span>
+                      <span style={{ fontSize: "7px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1 }}>mm</span>
+                    </div>
+                  );
+                })()}
+              </>
+            ) : (
+              // GRACE LWE diverging legend
+              <>
+                <svg viewBox="0 0 14 14" width="13" height="13" fill="none" style={{ flexShrink: 0 }}>
+                  <circle cx="7" cy="7" r="5.5" stroke="#f59e0b" strokeWidth="1.3"/>
+                  <circle cx="7" cy="7" r="2" fill="#f59e0b" fillOpacity="0.6"/>
+                  <line x1="7" y1="1" x2="7" y2="3" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
+                  <line x1="7" y1="11" x2="7" y2="13" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
+                  <line x1="1" y1="7" x2="3" y2="7" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
+                  <line x1="11" y1="7" x2="13" y2="7" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round"/>
+                </svg>
+                <span style={{ fontSize: "10px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>GRACE</span>
+                {/* Diverging color legend: Red=Loss→White=0→Blue=Gain */}
+                <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, marginLeft: 2 }}>
+                  <span style={{ fontSize: "8px", color: "#f87171", fontFamily: "monospace", lineHeight: 1, textAlign: "right", minWidth: 30 }}>
+                    {graceLegendRange ? (graceLegendRange.lo < 0 ? `−${Math.abs(graceLegendRange.lo).toFixed(1)}` : graceLegendRange.lo.toFixed(1)) : "−"}
+                  </span>
+                  <div style={{ position: "relative", flexShrink: 0 }}>
+                    <div style={{
+                      width: 52, height: 10, borderRadius: 3,
+                      background: "linear-gradient(to right, rgb(255,0,0), rgb(255,255,255), rgb(0,0,255))",
+                      border: `1px solid ${graceLegendRange ? "#f59e0b80" : "#30363d"}`,
+                      boxShadow: graceLegendRange ? "0 0 4px #f59e0b40" : "none",
+                    }}/>
+                    <div style={{
+                      position: "absolute", top: -2, left: "calc(50% - 0.5px)",
+                      width: 1, height: 14, background: "#ffffff80", pointerEvents: "none",
+                    }}/>
+                  </div>
+                  <span style={{ fontSize: "8px", color: "#60a5fa", fontFamily: "monospace", lineHeight: 1, minWidth: 30 }}>
+                    {graceLegendRange ? `+${graceLegendRange.hi.toFixed(1)}` : "+"}
+                  </span>
+                  {graceLegendRange && (
+                    <span style={{ fontSize: "7px", color: "#f59e0b", fontFamily: "monospace", lineHeight: 1 }}>cm</span>
+                  )}
+                </div>
+              </>
+            )}
           </div>
 
           {/* Divider */}
@@ -1857,50 +2072,51 @@ export default function GraceExplorer() {
         <div style={{ position: "absolute", top: HDR_H, left: TC_PANEL_W, width: mapW, height: bodyH, overflow: "hidden" }}>
           <div ref={mapRef} style={{ width: "100%", height: "100%" }} data-testid="map-container"/>
 
-          {/* ── GRACE YEAR TIMELINE + PLAYBACK CONTROLS — floats at top-center of map ── */}
+          {/* ── TIMELINE + PLAYBACK CONTROLS — floats at top-center of map ── */}
           <div style={{
             position: "absolute", top: 8, left: 64, right: 64, zIndex: 450,
             background: "rgba(13,17,23,0.92)",
-            border: "1px solid #f59e0b50",
+            border: `1px solid ${tcMapVar ? "#60a5fa50" : "#f59e0b50"}`,
             borderRadius: 8,
             padding: "7px 14px 6px",
             backdropFilter: "blur(6px)",
             boxShadow: "0 2px 12px rgba(0,0,0,0.55)",
             pointerEvents: "auto",
+            transition: "border-color 0.25s",
           }}>
 
-            {/* ROW 1: Playback controls + year label */}
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
+            {/* ROW 1: Playback controls + TC variable selector + badge */}
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5, flexWrap: "wrap" }}>
 
-              {/* Prev year button */}
+              {/* Prev button */}
               <button
                 onClick={() => stepYear(-1)}
-                title="Previous year"
+                title={tcMapVar ? "Previous month" : "Previous year"}
                 style={{
-                  background: "none", border: "1px solid #f59e0b60", borderRadius: 4,
-                  color: "#f59e0b", cursor: "pointer", padding: "2px 6px",
+                  background: "none", border: `1px solid ${tcMapVar ? "#60a5fa60" : "#f59e0b60"}`, borderRadius: 4,
+                  color: tcMapVar ? "#60a5fa" : "#f59e0b", cursor: "pointer", padding: "2px 6px",
                   fontSize: 13, lineHeight: 1, flexShrink: 0,
                   display: "flex", alignItems: "center",
                 }}
-              >◀</button>
+              >◄</button>
 
               {/* Play / Pause button */}
               <button
                 onClick={togglePlay}
-                title={isPlaying ? "Pause animation" : "Play through years 2002–2026"}
+                title={isPlaying ? "Pause animation" : tcMapVar ? "Play through months Jan–Dec" : "Play through years 2002–2026"}
                 style={{
-                  background: isPlaying ? "#7c3a0080" : "#7c5a0060",
-                  border: `1px solid ${isPlaying ? "#f59e0b" : "#f59e0b80"}`,
-                  borderRadius: 4, color: "#f59e0b", cursor: "pointer",
+                  background: isPlaying ? (tcMapVar ? "#0c244080" : "#7c3a0080") : (tcMapVar ? "#0c224060" : "#7c5a0060"),
+                  border: `1px solid ${isPlaying ? (tcMapVar ? "#60a5fa" : "#f59e0b") : (tcMapVar ? "#60a5fa80" : "#f59e0b80")}`,
+                  borderRadius: 4, color: tcMapVar ? "#60a5fa" : "#f59e0b", cursor: "pointer",
                   padding: "2px 10px", fontSize: 13, lineHeight: 1, flexShrink: 0,
                   display: "flex", alignItems: "center", gap: 4,
-                  boxShadow: isPlaying ? "0 0 6px #f59e0b50" : "none",
+                  boxShadow: isPlaying ? `0 0 6px ${tcMapVar ? "#60a5fa50" : "#f59e0b50"}` : "none",
                   transition: "all 0.15s",
                 }}
               >
                 {isPlaying ? (
                   <>
-                    <svg width="10" height="10" viewBox="0 0 10 10" fill="#f59e0b">
+                    <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
                       <rect x="1" y="1" width="3" height="8" rx="0.5"/>
                       <rect x="6" y="1" width="3" height="8" rx="0.5"/>
                     </svg>
@@ -1908,7 +2124,7 @@ export default function GraceExplorer() {
                   </>
                 ) : (
                   <>
-                    <svg width="10" height="10" viewBox="0 0 10 10" fill="#f59e0b">
+                    <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
                       <polygon points="1,0.5 9.5,5 1,9.5"/>
                     </svg>
                     Play
@@ -1916,17 +2132,17 @@ export default function GraceExplorer() {
                 )}
               </button>
 
-              {/* Next year button */}
+              {/* Next button */}
               <button
                 onClick={() => stepYear(1)}
-                title="Next year"
+                title={tcMapVar ? "Next month" : "Next year"}
                 style={{
-                  background: "none", border: "1px solid #f59e0b60", borderRadius: 4,
-                  color: "#f59e0b", cursor: "pointer", padding: "2px 6px",
+                  background: "none", border: `1px solid ${tcMapVar ? "#60a5fa60" : "#f59e0b60"}`, borderRadius: 4,
+                  color: tcMapVar ? "#60a5fa" : "#f59e0b", cursor: "pointer", padding: "2px 6px",
                   fontSize: 13, lineHeight: 1, flexShrink: 0,
                   display: "flex", alignItems: "center",
                 }}
-              >▶</button>
+              >►</button>
 
               {/* Divider */}
               <div style={{ width: 1, height: 18, background: "#30363d", flexShrink: 0, margin: "0 2px" }}/>
@@ -1954,49 +2170,132 @@ export default function GraceExplorer() {
               {/* Divider */}
               <div style={{ width: 1, height: 18, background: "#30363d", flexShrink: 0, margin: "0 2px" }}/>
 
-              {/* Opacity control (inline, compact) */}
-              <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
-                <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, whiteSpace: "nowrap" }}>Opacity</span>
-                <input
-                  type="range" min={0} max={100} step={5}
-                  value={Math.round(graceRasterOpacity * 100)}
-                  onChange={(e) => setGraceRasterOpacity(Number(e.target.value) / 100)}
-                  title={`GRACE raster opacity: ${Math.round(graceRasterOpacity * 100)}%`}
-                  style={{ width: 64, accentColor: "#f59e0b", cursor: "pointer" }}
-                />
-                <span style={{ fontSize: "10px", color: graceRasterOpacity > 0 ? "#f59e0b" : "#484f58", fontFamily: "monospace", width: 28, flexShrink: 0 }}>
-                  {graceRasterOpacity > 0 ? `${Math.round(graceRasterOpacity * 100)}%` : "off"}
-                </span>
+              {/* GRACE Opacity control — only in GRACE mode */}
+              {!tcMapVar && (
+                <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                  <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, whiteSpace: "nowrap" }}>Opacity</span>
+                  <input
+                    type="range" min={0} max={100} step={5}
+                    value={Math.round(graceRasterOpacity * 100)}
+                    onChange={(e) => setGraceRasterOpacity(Number(e.target.value) / 100)}
+                    title={`GRACE raster opacity: ${Math.round(graceRasterOpacity * 100)}%`}
+                    style={{ width: 64, accentColor: "#f59e0b", cursor: "pointer" }}
+                  />
+                  <span style={{ fontSize: "10px", color: graceRasterOpacity > 0 ? "#f59e0b" : "#484f58", fontFamily: "monospace", width: 28, flexShrink: 0 }}>
+                    {graceRasterOpacity > 0 ? `${Math.round(graceRasterOpacity * 100)}%` : "off"}
+                  </span>
+                </div>
+              )}
+
+              {/* Divider */}
+              <div style={{ width: 1, height: 18, background: "#30363d", flexShrink: 0, margin: "0 2px" }}/>
+
+              {/* TC Variable Selector — GRACE | P | AET | Q | BF */}
+              <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0 }}>
+                <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, whiteSpace: "nowrap", marginRight: 2 }}>TC Var:</span>
+                {/* GRACE button = disable TC overlay */}
+                <button
+                  onClick={() => { stopPlayback(); setTcMapVar(null); }}
+                  title="Show GRACE LWE raster (disable TC overlay)"
+                  style={{
+                    padding: "2px 7px", fontSize: "10px", fontWeight: tcMapVar === null ? 700 : 400,
+                    borderRadius: 4, border: `1px solid ${tcMapVar === null ? "#f59e0b" : "#30363d"}`,
+                    background: tcMapVar === null ? "#3a200022" : "transparent",
+                    color: tcMapVar === null ? "#f59e0b" : "#484f58",
+                    cursor: "pointer", transition: "all 0.12s",
+                  }}
+                >GRACE</button>
+                {/* TC variable buttons: P, AET, Q, BF */}
+                {(["ppt","aet","q","bf"] as TCMapVar[]).map(v => {
+                  const btnColors: Record<TCMapVar,string> = { ppt:"#60a5fa", aet:"#f87171", q:"#4ade80", bf:"#22d3ee" };
+                  const btnLabels: Record<TCMapVar,string> = { ppt:"P", aet:"AET", q:"Q", bf:"BF" };
+                  const btnTitles: Record<TCMapVar,string> = {
+                    ppt:"Precipitation (monthly mean)", aet:"Actual ET (monthly mean)",
+                    q:"Runoff (monthly mean)", bf:"Baseflow (monthly mean)"
+                  };
+                  const isActive = tcMapVar === v;
+                  const c = btnColors[v];
+                  return (
+                    <button
+                      key={v}
+                      onClick={() => { stopPlayback(); setTcMapVar(isActive ? null : v); }}
+                      title={btnTitles[v] + (tcResult ? "" : " — load TC data first")}
+                      disabled={!tcResult}
+                      style={{
+                        padding: "2px 7px", fontSize: "10px", fontWeight: isActive ? 700 : 400,
+                        borderRadius: 4, border: `1px solid ${isActive ? c : "#30363d"}`,
+                        background: isActive ? `${c}18` : "transparent",
+                        color: isActive ? c : (tcResult ? "#6e7681" : "#3a3a3a"),
+                        cursor: tcResult ? "pointer" : "not-allowed",
+                        transition: "all 0.12s",
+                        opacity: tcResult ? 1 : 0.4,
+                      }}
+                    >{btnLabels[v]}</button>
+                  );
+                })}
               </div>
 
-              {/* Year badge — pushed to right */}
+              {/* Badge — pushed to right: year (GRACE mode) or Month (TC mode) */}
               <div style={{ marginLeft: "auto", display: "flex", alignItems: "baseline", gap: 4, flexShrink: 0 }}>
-                <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>GRACE LWE</span>
-                <span style={{ fontSize: "15px", fontWeight: 700, fontFamily: "monospace", color: "#f59e0b" }}>{graceRasterYear}</span>
+                {tcMapVar ? (
+                  <>
+                    <span style={{ fontSize: "9px", color: "#60a5fa", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>{TC_MAP_LABELS[tcMapVar]}</span>
+                    <span style={{ fontSize: "15px", fontWeight: 700, fontFamily: "monospace", color: "#60a5fa" }}>{MONTH_LABELS[tcMapMonth]}</span>
+                  </>
+                ) : (
+                  <>
+                    <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>GRACE LWE</span>
+                    <span style={{ fontSize: "15px", fontWeight: 700, fontFamily: "monospace", color: "#f59e0b" }}>{graceRasterYear}</span>
+                  </>
+                )}
               </div>
             </div>
 
-            {/* ROW 2: Timeline slider */}
+            {/* ROW 2: Slider — month slider (TC mode) or year slider (GRACE mode) */}
             <div style={{ position: "relative" }}>
-              <input
-                type="range"
-                min={2002} max={2026} step={1}
-                value={graceRasterYear}
-                onChange={(e) => { stopPlayback(); setGraceRasterYear(Number(e.target.value)); }}
-                title={`GRACE LWE year: ${graceRasterYear}`}
-                style={{ width: "100%", accentColor: "#f59e0b", cursor: "pointer", height: 4, margin: 0, display: "block" }}
-              />
-              {/* Year tick marks every 3 years */}
-              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, pointerEvents: "none" }}>
-                {[2002, 2005, 2008, 2011, 2014, 2017, 2020, 2023, 2026].map(y => (
-                  <span key={y} style={{
-                    fontSize: "8px", fontFamily: "monospace",
-                    color: y === graceRasterYear ? "#f59e0b" : "#484f58",
-                    fontWeight: y === graceRasterYear ? 700 : 400,
-                    transition: "color 0.1s",
-                  }}>{y}</span>
-                ))}
-              </div>
+              {tcMapVar ? (
+                <>
+                  <input
+                    type="range"
+                    min={0} max={11} step={1}
+                    value={tcMapMonth}
+                    onChange={(e) => { stopPlayback(); setTcMapMonth(Number(e.target.value)); }}
+                    title={`TC month: ${MONTH_LABELS[tcMapMonth]}`}
+                    style={{ width: "100%", accentColor: "#60a5fa", cursor: "pointer", height: 4, margin: 0, display: "block" }}
+                  />
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, pointerEvents: "none" }}>
+                    {MONTH_LABELS.map((lbl, idx) => (
+                      <span key={lbl} style={{
+                        fontSize: "8px", fontFamily: "monospace",
+                        color: idx === tcMapMonth ? "#60a5fa" : "#484f58",
+                        fontWeight: idx === tcMapMonth ? 700 : 400,
+                        transition: "color 0.1s",
+                      }}>{lbl}</span>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <input
+                    type="range"
+                    min={2002} max={2026} step={1}
+                    value={graceRasterYear}
+                    onChange={(e) => { stopPlayback(); setGraceRasterYear(Number(e.target.value)); }}
+                    title={`GRACE LWE year: ${graceRasterYear}`}
+                    style={{ width: "100%", accentColor: "#f59e0b", cursor: "pointer", height: 4, margin: 0, display: "block" }}
+                  />
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, pointerEvents: "none" }}>
+                    {[2002, 2005, 2008, 2011, 2014, 2017, 2020, 2023, 2026].map(y => (
+                      <span key={y} style={{
+                        fontSize: "8px", fontFamily: "monospace",
+                        color: y === graceRasterYear ? "#f59e0b" : "#484f58",
+                        fontWeight: y === graceRasterYear ? 700 : 400,
+                        transition: "color 0.1s",
+                      }}>{y}</span>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
           </div>
 
