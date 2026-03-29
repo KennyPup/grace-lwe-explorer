@@ -104,13 +104,18 @@ export default function GraceExplorer() {
   const [tcChartMode, setTcChartMode] = useState<"annual" | "monthly_series" | "monthly_mean">("annual");
 
   // TC map overlay state
+  // tcMapVar: null = TC overlay hidden; non-null = active variable
+  // Now INDEPENDENT of GRACE — both can render simultaneously.
   const [tcMapVar, setTcMapVar] = useState<TCMapVar | null>(null);
   const [tcMapMonth, setTcMapMonth] = useState(0); // 0=Jan..11=Dec
+  const [tcRasterOpacity, setTcRasterOpacity] = useState(0.75); // 0–1
   const tcImageOverlayRef = useRef<L.ImageOverlay | null>(null);
   const tcMapVarRef = useRef<TCMapVar | null>(null);
   const tcMapMonthRef = useRef(0);
+  const tcRasterOpacityRef = useRef(0.75);
   useEffect(() => { tcMapVarRef.current = tcMapVar; }, [tcMapVar]);
   useEffect(() => { tcMapMonthRef.current = tcMapMonth; }, [tcMapMonth]);
+  useEffect(() => { tcRasterOpacityRef.current = tcRasterOpacity; }, [tcRasterOpacity]);
   // tcResultRef: stable ref to latest tcResult so renderTCRaster can read it without stale closure
   const tcResultRef = useRef<TCResult | null>(null);
   useEffect(() => { tcResultRef.current = tcResult; }, [tcResult]);
@@ -131,14 +136,28 @@ export default function GraceExplorer() {
   const graceRasterOpacityRef = useRef(0);
   useEffect(() => { graceRasterOpacityRef.current = graceRasterOpacity; }, [graceRasterOpacity]);
 
-  // Playback animation state
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [playFps, setPlayFps] = useState(1);
-  const playIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const isPlayingRef = useRef(false);
-  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
-  const playFpsRef = useRef(1);
-  useEffect(() => { playFpsRef.current = playFps; }, [playFps]);
+  // ── GRACE playback ────────────────────────────────────────────────────────
+  const [graceIsPlaying, setGraceIsPlaying] = useState(false);
+  const [gracePlayFps, setGracePlayFps] = useState(1);
+  const gracePlayIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const graceIsPlayingRef = useRef(false);
+  useEffect(() => { graceIsPlayingRef.current = graceIsPlaying; }, [graceIsPlaying]);
+  const gracePlayFpsRef = useRef(1);
+  useEffect(() => { gracePlayFpsRef.current = gracePlayFps; }, [gracePlayFps]);
+
+  // ── TC playback ───────────────────────────────────────────────────────────
+  const [tcIsPlaying, setTcIsPlaying] = useState(false);
+  const [tcPlayFps, setTcPlayFps] = useState(1);
+  const tcPlayIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const tcIsPlayingRef = useRef(false);
+  useEffect(() => { tcIsPlayingRef.current = tcIsPlaying; }, [tcIsPlaying]);
+  const tcPlayFpsRef = useRef(1);
+  useEffect(() => { tcPlayFpsRef.current = tcPlayFps; }, [tcPlayFps]);
+
+  // Legacy alias so existing call-sites still compile during transition
+  // (stopPlayback stops BOTH engines)
+  const isPlaying = graceIsPlaying || tcIsPlaying;
+  const playFps = gracePlayFps; // kept for any residual reference
 
   // Cache for raw grid data per year — so AOI stretch doesn't require a refetch
   type GraceGrid = { values: number[]; nLat: number; nLon: number; vmin: number; vmax: number };
@@ -496,8 +515,8 @@ export default function GraceExplorer() {
     // ── Place Leaflet ImageOverlay ────────────────────────────────────────
     if (tcImageOverlayRef.current) tcImageOverlayRef.current.remove();
     const overlay = L.imageOverlay(dataUrl, [[imgSouth, imgWest], [imgNorth, imgEast]], {
-      opacity: 0.75,
-      zIndex: 196, // above GRACE (195) so TC is visible on top
+      opacity: tcRasterOpacityRef.current,
+      zIndex: 196, // above GRACE (195) — TC sits on top when both layers are on
       interactive: false,
       className: 'tc-raster-overlay',
     });
@@ -512,14 +531,22 @@ export default function GraceExplorer() {
   const renderTCRasterRef = useRef(renderTCRaster);
   useEffect(() => { renderTCRasterRef.current = renderTCRaster; }, [renderTCRaster]);
 
-  // Re-render TC raster whenever variable or month changes (and tcResult is available)
+  // Re-render TC raster whenever variable or month changes
   useEffect(() => {
     if (!tcMapVar || !tcResult) {
+      // Remove overlay when no variable selected or no data loaded
       if (tcImageOverlayRef.current) { tcImageOverlayRef.current.remove(); tcImageOverlayRef.current = null; }
       return;
     }
     renderTCRasterRef.current(tcMapVar, tcMapMonth);
   }, [tcMapVar, tcMapMonth, tcResult]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Sync TC raster opacity live (without re-rendering the canvas)
+  useEffect(() => {
+    if (tcImageOverlayRef.current) {
+      tcImageOverlayRef.current.setOpacity(tcRasterOpacity);
+    }
+  }, [tcRasterOpacity]);
 
   // ── Background pre-fetch: silently cache grids for adjacent years ───────────────────
   const prefetchYear = useCallback(async (year: number) => {
@@ -534,74 +561,105 @@ export default function GraceExplorer() {
     } catch { /* silent */ }
   }, []);
 
-  // ── Playback engine ─────────────────────────────────────────────────────────────
-  const stopPlayback = useCallback(() => {
-    if (playIntervalRef.current) { clearInterval(playIntervalRef.current); playIntervalRef.current = null; }
-    setIsPlaying(false);
+  // ── GRACE Playback engine ──────────────────────────────────────────────────
+  const stopGracePlayback = useCallback(() => {
+    if (gracePlayIntervalRef.current) { clearInterval(gracePlayIntervalRef.current); gracePlayIntervalRef.current = null; }
+    setGraceIsPlaying(false);
   }, []);
 
-  const startPlayback = useCallback(() => {
-    if (playIntervalRef.current) clearInterval(playIntervalRef.current);
-    setIsPlaying(true);
-    playIntervalRef.current = setInterval(() => {
-      if (tcMapVarRef.current) {
-        // TC mode: cycle months 0→11
-        setTcMapMonth(prev => (prev + 1) % 12);
-      } else {
-        // GRACE mode: cycle years 2002→2026
-        setGraceRasterYear(prev => {
-          const next = prev >= 2026 ? 2002 : prev + 1;
-          const afterNext = next >= 2026 ? 2002 : next + 1;
-          prefetchYear(afterNext);
-          return next;
-        });
-      }
-    }, Math.round(1000 / playFpsRef.current));
+  const startGracePlayback = useCallback(() => {
+    if (gracePlayIntervalRef.current) clearInterval(gracePlayIntervalRef.current);
+    setGraceIsPlaying(true);
+    gracePlayIntervalRef.current = setInterval(() => {
+      setGraceRasterYear(prev => {
+        const next = prev >= 2026 ? 2002 : prev + 1;
+        const afterNext = next >= 2026 ? 2002 : next + 1;
+        prefetchYear(afterNext);
+        return next;
+      });
+    }, Math.round(1000 / gracePlayFpsRef.current));
   }, [prefetchYear]);
 
-  const togglePlay = useCallback(() => {
-    if (isPlayingRef.current) { stopPlayback(); } else { startPlayback(); }
-  }, [startPlayback, stopPlayback]);
+  const toggleGracePlay = useCallback(() => {
+    if (graceIsPlayingRef.current) { stopGracePlayback(); } else { startGracePlayback(); }
+  }, [startGracePlayback, stopGracePlayback]);
 
-  const stepYear = useCallback((delta: number) => {
-    stopPlayback();
-    if (tcMapVarRef.current) {
-      // TC mode: step months
-      setTcMapMonth(prev => ((prev + delta) % 12 + 12) % 12);
-    } else {
-      setGraceRasterYear(prev => {
-        const n = prev + delta;
-        return n < 2002 ? 2026 : n > 2026 ? 2002 : n;
-      });
-    }
-  }, [stopPlayback]);
+  const stepGraceYear = useCallback((delta: number) => {
+    stopGracePlayback();
+    setGraceRasterYear(prev => {
+      const n = prev + delta;
+      return n < 2002 ? 2026 : n > 2026 ? 2002 : n;
+    });
+  }, [stopGracePlayback]);
 
-  // Restart interval when FPS changes mid-play (keeps speed responsive)
+  // Restart GRACE interval when FPS changes mid-play
   useEffect(() => {
-    if (!isPlaying) return;
-    if (playIntervalRef.current) clearInterval(playIntervalRef.current);
-    playIntervalRef.current = setInterval(() => {
-      if (tcMapVarRef.current) {
-        setTcMapMonth(prev => (prev + 1) % 12);
-      } else {
-        setGraceRasterYear(prev => {
-          const next = prev >= 2026 ? 2002 : prev + 1;
-          prefetchYear(next >= 2026 ? 2002 : next + 1);
-          return next;
-        });
-      }
-    }, Math.round(1000 / Math.max(0.1, playFps)));
-    return () => { if (playIntervalRef.current) clearInterval(playIntervalRef.current); };
-  }, [playFps, isPlaying, prefetchYear]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!graceIsPlaying) return;
+    if (gracePlayIntervalRef.current) clearInterval(gracePlayIntervalRef.current);
+    gracePlayIntervalRef.current = setInterval(() => {
+      setGraceRasterYear(prev => {
+        const next = prev >= 2026 ? 2002 : prev + 1;
+        prefetchYear(next >= 2026 ? 2002 : next + 1);
+        return next;
+      });
+    }, Math.round(1000 / Math.max(0.1, gracePlayFps)));
+    return () => { if (gracePlayIntervalRef.current) clearInterval(gracePlayIntervalRef.current); };
+  }, [gracePlayFps, graceIsPlaying, prefetchYear]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Pre-fetch adjacent years whenever selected year changes (manual or playback)
+  // Pre-fetch adjacent years whenever selected year changes
   useEffect(() => {
     prefetchYear(graceRasterYear + 1 > 2026 ? 2002 : graceRasterYear + 1);
     prefetchYear(graceRasterYear - 1 < 2002 ? 2026 : graceRasterYear - 1);
   }, [graceRasterYear, prefetchYear]);
 
-  // Cleanup interval on unmount
-  useEffect(() => () => { if (playIntervalRef.current) clearInterval(playIntervalRef.current); }, []);
+  // Cleanup GRACE interval on unmount
+  useEffect(() => () => { if (gracePlayIntervalRef.current) clearInterval(gracePlayIntervalRef.current); }, []);
+
+  // ── TC Playback engine ────────────────────────────────────────────────────
+  const stopTCPlayback = useCallback(() => {
+    if (tcPlayIntervalRef.current) { clearInterval(tcPlayIntervalRef.current); tcPlayIntervalRef.current = null; }
+    setTcIsPlaying(false);
+  }, []);
+
+  const startTCPlayback = useCallback(() => {
+    if (tcPlayIntervalRef.current) clearInterval(tcPlayIntervalRef.current);
+    setTcIsPlaying(true);
+    tcPlayIntervalRef.current = setInterval(() => {
+      setTcMapMonth(prev => (prev + 1) % 12);
+    }, Math.round(1000 / tcPlayFpsRef.current));
+  }, []);
+
+  const toggleTCPlay = useCallback(() => {
+    if (tcIsPlayingRef.current) { stopTCPlayback(); } else { startTCPlayback(); }
+  }, [startTCPlayback, stopTCPlayback]);
+
+  const stepTCMonth = useCallback((delta: number) => {
+    stopTCPlayback();
+    setTcMapMonth(prev => ((prev + delta) % 12 + 12) % 12);
+  }, [stopTCPlayback]);
+
+  // Restart TC interval when FPS changes mid-play
+  useEffect(() => {
+    if (!tcIsPlaying) return;
+    if (tcPlayIntervalRef.current) clearInterval(tcPlayIntervalRef.current);
+    tcPlayIntervalRef.current = setInterval(() => {
+      setTcMapMonth(prev => (prev + 1) % 12);
+    }, Math.round(1000 / Math.max(0.1, tcPlayFps)));
+    return () => { if (tcPlayIntervalRef.current) clearInterval(tcPlayIntervalRef.current); };
+  }, [tcPlayFps, tcIsPlaying]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Cleanup TC interval on unmount
+  useEffect(() => () => { if (tcPlayIntervalRef.current) clearInterval(tcPlayIntervalRef.current); }, []);
+
+  // ── Legacy shims ──────────────────────────────────────────────────────────────
+  // stopPlayback stops BOTH engines (used by map-click handlers & search)
+  const stopPlayback = useCallback(() => {
+    stopGracePlayback();
+    stopTCPlayback();
+  }, [stopGracePlayback, stopTCPlayback]);
+  // stepYear / togglePlay kept so any other refs still compile
+  const stepYear = stepGraceYear;
+  const togglePlay = toggleGracePlay;
 
   // Convert raw fetch/HTTP errors into user-friendly messages
   // ---------------------------------------------------------------------------
@@ -2129,232 +2187,234 @@ export default function GraceExplorer() {
         <div style={{ position: "absolute", top: HDR_H, left: TC_PANEL_W, width: mapW, height: bodyH, overflow: "hidden" }}>
           <div ref={mapRef} style={{ width: "100%", height: "100%" }} data-testid="map-container"/>
 
-          {/* ── TIMELINE + PLAYBACK CONTROLS — floats at top-center of map ── */}
+          {/* ═══════════════════════════════════════════════════════════════
+               TOP BAR: ANNUAL STORAGE (GRACE)
+               Always visible, controls GRACE LWE year raster
+          ═══════════════════════════════════════════════════════════════ */}
           <div style={{
-            position: "absolute", top: 8, left: 64, right: 64, zIndex: 450,
-            background: "rgba(13,17,23,0.92)",
-            border: `1px solid ${tcMapVar ? "#60a5fa50" : "#f59e0b50"}`,
+            position: "absolute", top: 8, left: 54, right: 54, zIndex: 450,
+            background: "rgba(13,17,23,0.93)",
+            border: "1px solid #f59e0b50",
             borderRadius: 8,
-            padding: "7px 14px 6px",
+            padding: "5px 12px 5px",
             backdropFilter: "blur(6px)",
             boxShadow: "0 2px 12px rgba(0,0,0,0.55)",
             pointerEvents: "auto",
-            transition: "border-color 0.25s",
           }}>
-
-            {/* ROW 1: Playback controls + TC variable selector + badge */}
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5, flexWrap: "wrap" }}>
-
-              {/* Prev button */}
-              <button
-                onClick={() => stepYear(-1)}
-                title={tcMapVar ? "Previous month" : "Previous year"}
-                style={{
-                  background: "none", border: `1px solid ${tcMapVar ? "#60a5fa60" : "#f59e0b60"}`, borderRadius: 4,
-                  color: tcMapVar ? "#60a5fa" : "#f59e0b", cursor: "pointer", padding: "2px 6px",
-                  fontSize: 13, lineHeight: 1, flexShrink: 0,
-                  display: "flex", alignItems: "center",
-                }}
-              >◄</button>
-
-              {/* Play / Pause button */}
-              <button
-                onClick={togglePlay}
-                title={isPlaying ? "Pause animation" : tcMapVar ? "Play through months Jan–Dec" : "Play through years 2002–2026"}
-                style={{
-                  background: isPlaying ? (tcMapVar ? "#0c244080" : "#7c3a0080") : (tcMapVar ? "#0c224060" : "#7c5a0060"),
-                  border: `1px solid ${isPlaying ? (tcMapVar ? "#60a5fa" : "#f59e0b") : (tcMapVar ? "#60a5fa80" : "#f59e0b80")}`,
-                  borderRadius: 4, color: tcMapVar ? "#60a5fa" : "#f59e0b", cursor: "pointer",
-                  padding: "2px 10px", fontSize: 13, lineHeight: 1, flexShrink: 0,
-                  display: "flex", alignItems: "center", gap: 4,
-                  boxShadow: isPlaying ? `0 0 6px ${tcMapVar ? "#60a5fa50" : "#f59e0b50"}` : "none",
-                  transition: "all 0.15s",
-                }}
-              >
-                {isPlaying ? (
-                  <>
-                    <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
-                      <rect x="1" y="1" width="3" height="8" rx="0.5"/>
-                      <rect x="6" y="1" width="3" height="8" rx="0.5"/>
-                    </svg>
-                    Pause
-                  </>
-                ) : (
-                  <>
-                    <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
-                      <polygon points="1,0.5 9.5,5 1,9.5"/>
-                    </svg>
-                    Play
-                  </>
-                )}
-              </button>
-
-              {/* Next button */}
-              <button
-                onClick={() => stepYear(1)}
-                title={tcMapVar ? "Next month" : "Next year"}
-                style={{
-                  background: "none", border: `1px solid ${tcMapVar ? "#60a5fa60" : "#f59e0b60"}`, borderRadius: 4,
-                  color: tcMapVar ? "#60a5fa" : "#f59e0b", cursor: "pointer", padding: "2px 6px",
-                  fontSize: 13, lineHeight: 1, flexShrink: 0,
-                  display: "flex", alignItems: "center",
-                }}
-              >►</button>
-
-              {/* Divider */}
-              <div style={{ width: 1, height: 18, background: "#30363d", flexShrink: 0, margin: "0 2px" }}/>
-
-              {/* FPS input */}
-              <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
-                <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, whiteSpace: "nowrap" }}>FPS</span>
-                <input
-                  type="number"
-                  min={0.1} max={10} step={0.5}
-                  value={playFps}
-                  onChange={(e) => {
-                    const v = parseFloat(e.target.value);
-                    if (!isNaN(v) && v > 0) setPlayFps(v);
-                  }}
-                  title="Playback speed in frames per second"
+            {/* Label row */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+              <span style={{ fontSize: "9px", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "#f59e0b", opacity: 0.85 }}>
+                Annual Storage (GRACE)
+              </span>
+              {/* Controls row inline */}
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                {/* Prev */}
+                <button onClick={() => stepGraceYear(-1)} title="Previous year"
+                  style={{ background: "none", border: "1px solid #f59e0b60", borderRadius: 4,
+                    color: "#f59e0b", cursor: "pointer", padding: "1px 5px", fontSize: 12, lineHeight: 1, display: "flex", alignItems: "center" }}
+                >◄</button>
+                {/* Play/Pause */}
+                <button onClick={toggleGracePlay}
+                  title={graceIsPlaying ? "Pause GRACE animation" : "Play GRACE years 2002–2026"}
                   style={{
-                    width: 44, padding: "1px 4px", fontSize: "11px", fontFamily: "monospace",
+                    background: graceIsPlaying ? "#7c3a0080" : "#7c5a0060",
+                    border: `1px solid ${graceIsPlaying ? "#f59e0b" : "#f59e0b80"}`,
+                    borderRadius: 4, color: "#f59e0b", cursor: "pointer",
+                    padding: "1px 8px", fontSize: 12, lineHeight: 1,
+                    display: "flex", alignItems: "center", gap: 3,
+                    boxShadow: graceIsPlaying ? "0 0 6px #f59e0b50" : "none",
+                    transition: "all 0.15s",
+                  }}>
+                  {graceIsPlaying ? (
+                    <><svg width="8" height="8" viewBox="0 0 10 10" fill="currentColor"><rect x="1" y="1" width="3" height="8" rx="0.5"/><rect x="6" y="1" width="3" height="8" rx="0.5"/></svg>Pause</>
+                  ) : (
+                    <><svg width="8" height="8" viewBox="0 0 10 10" fill="currentColor"><polygon points="1,0.5 9.5,5 1,9.5"/></svg>Play</>
+                  )}
+                </button>
+                {/* Next */}
+                <button onClick={() => stepGraceYear(1)} title="Next year"
+                  style={{ background: "none", border: "1px solid #f59e0b60", borderRadius: 4,
+                    color: "#f59e0b", cursor: "pointer", padding: "1px 5px", fontSize: 12, lineHeight: 1, display: "flex", alignItems: "center" }}
+                >►</button>
+                {/* Divider */}
+                <div style={{ width: 1, height: 14, background: "#30363d", margin: "0 2px" }}/>
+                {/* FPS */}
+                <span style={{ fontSize: "9px", color: "#8b949e", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.07em" }}>FPS</span>
+                <input type="number" min={0.1} max={10} step={0.5} value={gracePlayFps}
+                  onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v > 0) setGracePlayFps(v); }}
+                  style={{ width: 38, padding: "1px 3px", fontSize: "10px", fontFamily: "monospace",
                     background: "#0d1117", border: "1px solid #f59e0b60", borderRadius: 4,
-                    color: "#f59e0b", outline: "none", textAlign: "center",
-                  }}
+                    color: "#f59e0b", outline: "none", textAlign: "center" }}
                 />
-              </div>
-
-              {/* Divider */}
-              <div style={{ width: 1, height: 18, background: "#30363d", flexShrink: 0, margin: "0 2px" }}/>
-
-              {/* GRACE Opacity control — only in GRACE mode */}
-              {!tcMapVar && (
-                <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
-                  <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, whiteSpace: "nowrap" }}>Opacity</span>
-                  <input
-                    type="range" min={0} max={100} step={5}
-                    value={Math.round(graceRasterOpacity * 100)}
-                    onChange={(e) => setGraceRasterOpacity(Number(e.target.value) / 100)}
-                    title={`GRACE raster opacity: ${Math.round(graceRasterOpacity * 100)}%`}
-                    style={{ width: 64, accentColor: "#f59e0b", cursor: "pointer" }}
-                  />
-                  <span style={{ fontSize: "10px", color: graceRasterOpacity > 0 ? "#f59e0b" : "#484f58", fontFamily: "monospace", width: 28, flexShrink: 0 }}>
-                    {graceRasterOpacity > 0 ? `${Math.round(graceRasterOpacity * 100)}%` : "off"}
-                  </span>
-                </div>
-              )}
-
-              {/* Divider */}
-              <div style={{ width: 1, height: 18, background: "#30363d", flexShrink: 0, margin: "0 2px" }}/>
-
-              {/* TC Variable Selector — GRACE | P | AET | Q | BF */}
-              <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0 }}>
-                <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, whiteSpace: "nowrap", marginRight: 2 }}>TC Var:</span>
-                {/* GRACE button = disable TC overlay */}
-                <button
-                  onClick={() => { stopPlayback(); setTcMapVar(null); }}
-                  title="Show GRACE LWE raster (disable TC overlay)"
-                  style={{
-                    padding: "2px 7px", fontSize: "10px", fontWeight: tcMapVar === null ? 700 : 400,
-                    borderRadius: 4, border: `1px solid ${tcMapVar === null ? "#f59e0b" : "#30363d"}`,
-                    background: tcMapVar === null ? "#3a200022" : "transparent",
-                    color: tcMapVar === null ? "#f59e0b" : "#484f58",
-                    cursor: "pointer", transition: "all 0.12s",
-                  }}
-                >GRACE</button>
-                {/* TC variable buttons: P, AET, Q, BF */}
-                {(["ppt","aet","q","bf"] as TCMapVar[]).map(v => {
-                  const btnColors: Record<TCMapVar,string> = { ppt:"#60a5fa", aet:"#f87171", q:"#4ade80", bf:"#22d3ee" };
-                  const btnLabels: Record<TCMapVar,string> = { ppt:"P", aet:"AET", q:"Q", bf:"BF" };
-                  const btnTitles: Record<TCMapVar,string> = {
-                    ppt:"Precipitation (monthly mean)", aet:"Actual ET (monthly mean)",
-                    q:"Runoff (monthly mean)", bf:"Baseflow (monthly mean)"
-                  };
-                  const isActive = tcMapVar === v;
-                  const c = btnColors[v];
-                  return (
-                    <button
-                      key={v}
-                      onClick={() => { stopPlayback(); setTcMapVar(isActive ? null : v); }}
-                      title={btnTitles[v] + (tcResult ? "" : " — load TC data first")}
-                      disabled={!tcResult}
-                      style={{
-                        padding: "2px 7px", fontSize: "10px", fontWeight: isActive ? 700 : 400,
-                        borderRadius: 4, border: `1px solid ${isActive ? c : "#30363d"}`,
-                        background: isActive ? `${c}18` : "transparent",
-                        color: isActive ? c : (tcResult ? "#6e7681" : "#3a3a3a"),
-                        cursor: tcResult ? "pointer" : "not-allowed",
-                        transition: "all 0.12s",
-                        opacity: tcResult ? 1 : 0.4,
-                      }}
-                    >{btnLabels[v]}</button>
-                  );
-                })}
-              </div>
-
-              {/* Badge — pushed to right: year (GRACE mode) or Month (TC mode) */}
-              <div style={{ marginLeft: "auto", display: "flex", alignItems: "baseline", gap: 4, flexShrink: 0 }}>
-                {tcMapVar ? (
-                  <>
-                    <span style={{ fontSize: "9px", color: "#60a5fa", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>{TC_MAP_LABELS[tcMapVar]}</span>
-                    <span style={{ fontSize: "15px", fontWeight: 700, fontFamily: "monospace", color: "#60a5fa" }}>{MONTH_LABELS[tcMapMonth]}</span>
-                  </>
-                ) : (
-                  <>
-                    <span style={{ fontSize: "9px", color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>GRACE LWE</span>
-                    <span style={{ fontSize: "15px", fontWeight: 700, fontFamily: "monospace", color: "#f59e0b" }}>{graceRasterYear}</span>
-                  </>
-                )}
+                {/* Divider */}
+                <div style={{ width: 1, height: 14, background: "#30363d", margin: "0 2px" }}/>
+                {/* Opacity */}
+                <span style={{ fontSize: "9px", color: "#8b949e", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.07em" }}>Opacity</span>
+                <input type="range" min={0} max={100} step={5}
+                  value={Math.round(graceRasterOpacity * 100)}
+                  onChange={(e) => setGraceRasterOpacity(Number(e.target.value) / 100)}
+                  style={{ width: 56, accentColor: "#f59e0b", cursor: "pointer" }}
+                />
+                <span style={{ fontSize: "10px", color: graceRasterOpacity > 0 ? "#f59e0b" : "#484f58", fontFamily: "monospace", width: 28, flexShrink: 0 }}>
+                  {graceRasterOpacity > 0 ? `${Math.round(graceRasterOpacity * 100)}%` : "off"}
+                </span>
+                {/* Divider */}
+                <div style={{ width: 1, height: 14, background: "#30363d", margin: "0 2px" }}/>
+                {/* Year badge */}
+                <span style={{ fontSize: "9px", color: "#8b949e", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.07em" }}>LWE</span>
+                <span style={{ fontSize: "15px", fontWeight: 700, fontFamily: "monospace", color: "#f59e0b", minWidth: 36, textAlign: "right" }}>{graceRasterYear}</span>
               </div>
             </div>
-
-            {/* ROW 2: Slider — month slider (TC mode) or year slider (GRACE mode) */}
+            {/* Year slider */}
             <div style={{ position: "relative" }}>
-              {tcMapVar ? (
-                <>
-                  <input
-                    type="range"
-                    min={0} max={11} step={1}
-                    value={tcMapMonth}
-                    onChange={(e) => { stopPlayback(); setTcMapMonth(Number(e.target.value)); }}
-                    title={`TC month: ${MONTH_LABELS[tcMapMonth]}`}
-                    style={{ width: "100%", accentColor: "#60a5fa", cursor: "pointer", height: 4, margin: 0, display: "block" }}
-                  />
-                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, pointerEvents: "none" }}>
-                    {MONTH_LABELS.map((lbl, idx) => (
-                      <span key={lbl} style={{
-                        fontSize: "8px", fontFamily: "monospace",
-                        color: idx === tcMapMonth ? "#60a5fa" : "#484f58",
-                        fontWeight: idx === tcMapMonth ? 700 : 400,
-                        transition: "color 0.1s",
-                      }}>{lbl}</span>
-                    ))}
-                  </div>
-                </>
-              ) : (
-                <>
-                  <input
-                    type="range"
-                    min={2002} max={2026} step={1}
-                    value={graceRasterYear}
-                    onChange={(e) => { stopPlayback(); setGraceRasterYear(Number(e.target.value)); }}
-                    title={`GRACE LWE year: ${graceRasterYear}`}
-                    style={{ width: "100%", accentColor: "#f59e0b", cursor: "pointer", height: 4, margin: 0, display: "block" }}
-                  />
-                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, pointerEvents: "none" }}>
-                    {[2002, 2005, 2008, 2011, 2014, 2017, 2020, 2023, 2026].map(y => (
-                      <span key={y} style={{
-                        fontSize: "8px", fontFamily: "monospace",
-                        color: y === graceRasterYear ? "#f59e0b" : "#484f58",
-                        fontWeight: y === graceRasterYear ? 700 : 400,
-                        transition: "color 0.1s",
-                      }}>{y}</span>
-                    ))}
-                  </div>
-                </>
-              )}
+              <input type="range" min={2002} max={2026} step={1}
+                value={graceRasterYear}
+                onChange={(e) => { stopGracePlayback(); setGraceRasterYear(Number(e.target.value)); }}
+                title={`GRACE LWE year: ${graceRasterYear}`}
+                style={{ width: "100%", accentColor: "#f59e0b", cursor: "pointer", height: 4, margin: 0, display: "block" }}
+              />
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, pointerEvents: "none" }}>
+                {[2002, 2005, 2008, 2011, 2014, 2017, 2020, 2023, 2026].map(y => (
+                  <span key={y} style={{ fontSize: "8px", fontFamily: "monospace",
+                    color: y === graceRasterYear ? "#f59e0b" : "#484f58",
+                    fontWeight: y === graceRasterYear ? 700 : 400, transition: "color 0.1s" }}>{y}</span>
+                ))}
+              </div>
             </div>
           </div>
+
+          {/* ═══════════════════════════════════════════════════════════════
+               BOTTOM BAR: SEASONAL FLUX (TERRACLIMATE)
+               Appears only after TC data is calculated.
+               Controls TC variable + month raster. Both layers can render
+               simultaneously (TC z-index 196 sits on top of GRACE 195).
+          ═══════════════════════════════════════════════════════════════ */}
+          {tcResult && (
+            <div style={{
+              position: "absolute", bottom: 8, left: 54, right: 54, zIndex: 450,
+              background: "rgba(13,17,23,0.93)",
+              border: `1px solid ${tcMapVar ? "#60a5fa60" : "#30363d"}`,
+              borderRadius: 8,
+              padding: "5px 12px 5px",
+              backdropFilter: "blur(6px)",
+              boxShadow: "0 2px 12px rgba(0,0,0,0.55)",
+              pointerEvents: "auto",
+              transition: "border-color 0.2s",
+            }}>
+              {/* Label row */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                <span style={{ fontSize: "9px", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "#60a5fa", opacity: 0.85 }}>
+                  Seasonal Flux (TerraClimate)
+                </span>
+                {/* Controls row inline */}
+                <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                  {/* Prev */}
+                  <button onClick={() => stepTCMonth(-1)} title="Previous month"
+                    style={{ background: "none", border: `1px solid ${tcMapVar ? "#60a5fa60" : "#30363d"}`, borderRadius: 4,
+                      color: tcMapVar ? "#60a5fa" : "#484f58", cursor: "pointer", padding: "1px 5px", fontSize: 12, lineHeight: 1, display: "flex", alignItems: "center" }}
+                  >◄</button>
+                  {/* Play/Pause */}
+                  <button onClick={toggleTCPlay}
+                    title={tcIsPlaying ? "Pause TC animation" : "Play TC months Jan–Dec"}
+                    disabled={!tcMapVar}
+                    style={{
+                      background: tcIsPlaying ? "#0c244080" : "#0c224060",
+                      border: `1px solid ${tcIsPlaying ? "#60a5fa" : "#60a5fa80"}`,
+                      borderRadius: 4, color: "#60a5fa", cursor: tcMapVar ? "pointer" : "not-allowed",
+                      padding: "1px 8px", fontSize: 12, lineHeight: 1,
+                      display: "flex", alignItems: "center", gap: 3,
+                      boxShadow: tcIsPlaying ? "0 0 6px #60a5fa50" : "none",
+                      transition: "all 0.15s",
+                      opacity: tcMapVar ? 1 : 0.4,
+                    }}>
+                    {tcIsPlaying ? (
+                      <><svg width="8" height="8" viewBox="0 0 10 10" fill="currentColor"><rect x="1" y="1" width="3" height="8" rx="0.5"/><rect x="6" y="1" width="3" height="8" rx="0.5"/></svg>Pause</>
+                    ) : (
+                      <><svg width="8" height="8" viewBox="0 0 10 10" fill="currentColor"><polygon points="1,0.5 9.5,5 1,9.5"/></svg>Play</>
+                    )}
+                  </button>
+                  {/* Next */}
+                  <button onClick={() => stepTCMonth(1)} title="Next month"
+                    style={{ background: "none", border: `1px solid ${tcMapVar ? "#60a5fa60" : "#30363d"}`, borderRadius: 4,
+                      color: tcMapVar ? "#60a5fa" : "#484f58", cursor: "pointer", padding: "1px 5px", fontSize: 12, lineHeight: 1, display: "flex", alignItems: "center" }}
+                  >►</button>
+                  {/* Divider */}
+                  <div style={{ width: 1, height: 14, background: "#30363d", margin: "0 2px" }}/>
+                  {/* FPS */}
+                  <span style={{ fontSize: "9px", color: "#8b949e", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.07em" }}>FPS</span>
+                  <input type="number" min={0.1} max={10} step={0.5} value={tcPlayFps}
+                    onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v > 0) setTcPlayFps(v); }}
+                    style={{ width: 38, padding: "1px 3px", fontSize: "10px", fontFamily: "monospace",
+                      background: "#0d1117", border: "1px solid #60a5fa60", borderRadius: 4,
+                      color: "#60a5fa", outline: "none", textAlign: "center" }}
+                  />
+                  {/* Divider */}
+                  <div style={{ width: 1, height: 14, background: "#30363d", margin: "0 2px" }}/>
+                  {/* TC Variable buttons: P | AET | Q | BF */}
+                  {([["ppt","P","#60a5fa","Precipitation"],["aet","AET","#f87171","Actual ET"],["q","Q","#4ade80","Runoff"],["bf","BF","#22d3ee","Baseflow"]] as [TCMapVar,string,string,string][]).map(([v,lbl,c,title]) => {
+                    const isActive = tcMapVar === v;
+                    return (
+                      <button key={v}
+                        onClick={() => { stopTCPlayback(); setTcMapVar(isActive ? null : v); }}
+                        title={title}
+                        style={{
+                          padding: "1px 6px", fontSize: "10px", fontWeight: isActive ? 700 : 400,
+                          borderRadius: 4, border: `1px solid ${isActive ? c : "#30363d"}`,
+                          background: isActive ? `${c}22` : "transparent",
+                          color: isActive ? c : "#6e7681",
+                          cursor: "pointer", transition: "all 0.12s",
+                        }}
+                      >{lbl}</button>
+                    );
+                  })}
+                  {/* Divider */}
+                  <div style={{ width: 1, height: 14, background: "#30363d", margin: "0 2px" }}/>
+                  {/* TC Opacity */}
+                  <span style={{ fontSize: "9px", color: "#8b949e", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.07em" }}>Opacity</span>
+                  <input type="range" min={0} max={100} step={5}
+                    value={Math.round(tcRasterOpacity * 100)}
+                    onChange={(e) => setTcRasterOpacity(Number(e.target.value) / 100)}
+                    style={{ width: 56, accentColor: "#60a5fa", cursor: "pointer" }}
+                  />
+                  <span style={{ fontSize: "10px", color: tcRasterOpacity > 0 ? "#60a5fa" : "#484f58", fontFamily: "monospace", width: 28, flexShrink: 0 }}>
+                    {tcRasterOpacity > 0 ? `${Math.round(tcRasterOpacity * 100)}%` : "off"}
+                  </span>
+                  {/* Divider */}
+                  <div style={{ width: 1, height: 14, background: "#30363d", margin: "0 2px" }}/>
+                  {/* Month badge */}
+                  {tcMapVar ? (
+                    <>
+                      <span style={{ fontSize: "9px", color: "#60a5fa", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.07em" }}>
+                        {tcMapVar === "ppt" ? "Precip" : tcMapVar === "aet" ? "Act.ET" : tcMapVar === "q" ? "Runoff" : "Baseflow"}
+                      </span>
+                      <span style={{ fontSize: "15px", fontWeight: 700, fontFamily: "monospace", color: "#60a5fa", minWidth: 30, textAlign: "right" }}>
+                        {MONTH_LABELS[tcMapMonth]}
+                      </span>
+                    </>
+                  ) : (
+                    <span style={{ fontSize: "10px", color: "#484f58", fontStyle: "italic" }}>select a variable above</span>
+                  )}
+                </div>
+              </div>
+              {/* Month slider */}
+              <div style={{ position: "relative" }}>
+                <input type="range" min={0} max={11} step={1}
+                  value={tcMapMonth}
+                  onChange={(e) => { stopTCPlayback(); setTcMapMonth(Number(e.target.value)); }}
+                  title={`TC month: ${MONTH_LABELS[tcMapMonth]}`}
+                  style={{ width: "100%", accentColor: "#60a5fa", cursor: "pointer", height: 4, margin: 0, display: "block" }}
+                />
+                <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, pointerEvents: "none" }}>
+                  {MONTH_LABELS.map((lbl, idx) => (
+                    <span key={lbl} style={{ fontSize: "8px", fontFamily: "monospace",
+                      color: idx === tcMapMonth ? "#60a5fa" : "#484f58",
+                      fontWeight: idx === tcMapMonth ? 700 : 400, transition: "color 0.1s" }}>{lbl}</span>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
 
           {/* ── FLOATING HYDROLOGY PANEL (bottom-left of map) ── */}
           <div style={{
