@@ -82,7 +82,9 @@ def fetch_point_year(var, year, lat_idx, lon_idx, retries=3):
             raise RuntimeError(f"Failed to fetch {var} {year}: {e}")
 
 def fetch_bbox_year(var, year, lat_top_idx, lat_bot_idx, lon_left_idx, lon_right_idx, retries=3):
-    """Fetch and spatially average all grid cells within bbox for one year."""
+    """Fetch all grid cells within bbox for one year.
+    Returns (monthly_means_list, spatial_3d_array) where spatial_3d_array has shape (12, nrows, ncols).
+    """
     from netCDF4 import Dataset
     import numpy as np
     
@@ -109,15 +111,15 @@ def fetch_bbox_year(var, year, lat_top_idx, lat_bot_idx, lon_left_idx, lon_right
             monthly = []
             for m in range(12):
                 month_data = vals[m, :, :]
-                # Compute mean over unmasked cells
-                valid = month_data[~np.ma.getmaskarray(month_data)].data if hasattr(month_data, 'mask') else month_data.flatten()
                 if hasattr(month_data, 'compressed'):
                     valid = month_data.compressed()
+                else:
+                    valid = month_data.flatten()
                 if len(valid) > 0:
                     monthly.append(float(np.mean(valid)))
                 else:
                     monthly.append(None)
-            return monthly
+            return monthly, vals  # also return raw 3D array
         except Exception as e:
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
@@ -128,7 +130,7 @@ def build_series(monthly_by_year):
     """
     Returns:
     - monthly_series: [{month: "YYYY-MM", value: float|None}, ...]
-    - annual_series: [{year: int, value: float|None}, ...]  (mean of 12 months)
+    - annual_series: [{year: int, value: float|None}, ...]  (sum of 12 months)
     - monthly_means: [float|None] × 12 (climatological mean for each calendar month)
     """
     monthly_series = []
@@ -151,6 +153,60 @@ def build_series(monthly_by_year):
         monthly_means.append(sum(acc) / len(acc) if acc else None)
     
     return monthly_series, annual_series, monthly_means
+
+
+def build_spatial_monthly_means(spatial_by_year):
+    """
+    Given a dict {year: ndarray(12, nrows, ncols)}, compute the climatological
+    monthly mean for each pixel: output shape (12, nrows, ncols).
+    Returns a nested list [month][row][col] = float|None  (north-to-south row order).
+    Also returns (nrows, ncols, lat_bounds, lon_bounds) for the frontend.
+    """
+    import numpy as np
+    
+    if not spatial_by_year:
+        return None, 0, 0
+    
+    # Stack years: shape (nyears, 12, nrows, ncols)
+    years = sorted(spatial_by_year.keys())
+    arrays = []
+    ref_shape = None
+    for yr in years:
+        arr = spatial_by_year[yr]
+        if ref_shape is None:
+            ref_shape = arr.shape  # (12, nrows, ncols)
+        # Convert masked array to float with NaN for masked values
+        if hasattr(arr, 'filled'):
+            arr_f = arr.filled(np.nan).astype(float)
+        else:
+            arr_f = np.array(arr, dtype=float)
+        if arr_f.shape == ref_shape:
+            arrays.append(arr_f)
+    
+    if not arrays:
+        return None, 0, 0
+    
+    stacked = np.stack(arrays, axis=0)  # (nyears, 12, nrows, ncols)
+    # Mean over years, ignoring NaN
+    means = np.nanmean(stacked, axis=0)  # (12, nrows, ncols)
+    
+    nrows = means.shape[1]
+    ncols = means.shape[2]
+    
+    # Convert to nested list: [month_idx][row][col] = float|None
+    # Row 0 = northernmost (matches TC grid: top row = highest lat)
+    result = []
+    for m in range(12):
+        row_list = []
+        for r in range(nrows):
+            col_list = []
+            for c in range(ncols):
+                v = float(means[m, r, c])
+                col_list.append(None if (v != v) else v)  # NaN → None
+            row_list.append(col_list)
+        result.append(row_list)
+    
+    return result, nrows, ncols
 
 def run_point(lat, lon):
     lat_idx = lat_to_idx(lat)
@@ -191,22 +247,32 @@ def run_bbox(minLat, maxLat, minLon, maxLon):
     output = {"bbox": {"minLat": minLat, "maxLat": maxLat, "minLon": minLon, "maxLon": maxLon}, "variables": {}}
     
     for var in VARS:
-        monthly_by_year = {}
+        monthly_by_year = {}   # year -> [12 scalar means]
+        spatial_by_year = {}   # year -> ndarray(12, nrows, ncols)
         errors = []
         for year in range(START_YEAR, END_YEAR + 1):
             try:
-                monthly = fetch_bbox_year(var, year, lat_top_idx, lat_bot_idx, lon_left_idx, lon_right_idx)
+                monthly, spatial = fetch_bbox_year(var, year, lat_top_idx, lat_bot_idx, lon_left_idx, lon_right_idx)
                 monthly_by_year[year] = monthly
+                spatial_by_year[year] = spatial
             except Exception as e:
                 errors.append(f"{year}: {e}")
                 monthly_by_year[year] = [None] * 12
         
         monthly_series, annual_series, monthly_means = build_series(monthly_by_year)
+        
+        # Build per-pixel climatological monthly means
+        spatial_grid, nrows, ncols = build_spatial_monthly_means(spatial_by_year)
+        
         output["variables"][var] = {
             "monthly": monthly_series,
             "annual": annual_series,
             "monthly_means": monthly_means,
         }
+        # Only include spatial grid if it has multiple pixels (skip for single-pixel regions)
+        if spatial_grid is not None and nrows * ncols > 1:
+            output["variables"][var]["spatial_grid"] = spatial_grid
+            output["variables"][var]["grid_shape"] = [nrows, ncols]
         if errors:
             output["variables"][var]["errors"] = errors
     

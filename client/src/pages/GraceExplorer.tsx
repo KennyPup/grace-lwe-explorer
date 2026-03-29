@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback, memo, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest, isRetryableError } from "@/lib/queryClient";
 import {
@@ -34,6 +34,10 @@ interface TCVarSeries {
   monthly: { month: string; value: number | null }[];
   annual: { year: number; value: number | null }[];
   monthly_means: (number | null)[];
+  // bbox mode only: per-pixel climatological monthly means
+  // shape: [12 months][nrows][ncols], row 0 = northernmost
+  spatial_grid?: (number | null)[][][];
+  grid_shape?: [number, number]; // [nrows, ncols]
 }
 interface TCResult {
   lat?: number; lon?: number;
@@ -55,6 +59,50 @@ async function geocode(query: string): Promise<{ lat: number; lon: number; displ
   if (!data || data.length === 0) return null;
   return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon), displayName: data[0].display_name };
 }
+
+// ── Memoized bar chart component ──────────────────────────────────────────
+// Defined OUTSIDE GraceExplorer so React's reconciler treats it as a stable
+// component type and never unmounts/remounts it during parent re-renders.
+// Props are computed from tcResult+tcChartMode only — NOT from tcMapMonth/tcMapVar.
+const TCBarChartStatic = memo(function TCBarChartStatic({
+  data, color, label, interval, maxBarSize
+}: {
+  data: { label: string; value: number | null }[];
+  color: string;
+  label: string;
+  interval: number;
+  maxBarSize: number;
+}) {
+  return (
+    <div style={{ height: 110, padding: "0 2px 0 0" }}>
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} margin={{ top: 2, right: 6, left: -14, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#21262d" vertical={false}/>
+          <XAxis
+            dataKey="label"
+            tick={{ fill: "#6e7681", fontSize: 9, fontFamily: "monospace" }}
+            tickLine={false}
+            axisLine={{ stroke: "#30363d" }}
+            interval={interval}
+          />
+          <YAxis
+            tick={{ fill: "#6e7681", fontSize: 9, fontFamily: "monospace" }}
+            tickLine={false}
+            axisLine={false}
+            tickFormatter={(v: number) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v.toFixed(0)}
+            width={32}
+          />
+          <Tooltip
+            contentStyle={{ background: "#161b22", border: "1px solid #30363d", borderRadius: 6, fontSize: 10, fontFamily: "monospace", color: "#e6edf3" }}
+            cursor={{ fill: "#21262d" }}
+            formatter={(val: number) => [`${val?.toFixed(1)} mm`, label]}
+          />
+          <Bar dataKey="value" maxBarSize={maxBarSize} radius={[2, 2, 0, 0]} fill={color} fillOpacity={0.85}/>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+});
 
 export default function GraceExplorer() {
   const rootRef = useRef<HTMLDivElement>(null);
@@ -420,34 +468,93 @@ export default function GraceExplorer() {
     if (!leafletMap.current) return;
 
     const aoi = graceAoiRef.current;
-    const tc = tcResultRef.current;
+    const tc  = tcResultRef.current;
     if (!aoi || !tc) {
       if (tcImageOverlayRef.current) { tcImageOverlayRef.current.remove(); tcImageOverlayRef.current = null; }
       return;
     }
 
-    // ── Get the 12 monthly-mean values for the selected variable ─────────
-    let means: (number | null)[];
+    // ── Decide data source — spatial grid (bbox) or scalar fallback (point) –
+    // Baseflow has no spatial_grid because it is derived client-side from means;
+    // fall back to per-pixel derived grid when the three source variables have grids.
+    let spatialGrid: (number | null)[][] | null = null;   // [row][col] for this month
+    let gridNRows = 0;
+    let gridNCols = 0;
+
     if (varKey === "bf") {
-      means = baseflowMeansRef.current;
+      // Derive pixel-level baseflow from spatial grids of ppt, aet, q
+      const pG = tc.variables.ppt.spatial_grid;
+      const aG = tc.variables.aet.spatial_grid;
+      const qG = tc.variables.q.spatial_grid;
+      if (pG && aG && qG && pG[monthIdx] && aG[monthIdx] && qG[monthIdx]) {
+        const pRows = pG[monthIdx];
+        gridNRows = pRows.length;
+        gridNCols = pRows[0]?.length ?? 0;
+        spatialGrid = pRows.map((row, r) =>
+          row.map((p, c) => {
+            const a = aG[monthIdx][r]?.[c] ?? null;
+            const q = qG[monthIdx][r]?.[c] ?? null;
+            if (p === null || a === null || q === null) return null;
+            return Math.max(0, p - a - q);
+          })
+        );
+      }
     } else {
-      means = tc.variables[varKey].monthly_means;
+      const sg = tc.variables[varKey].spatial_grid;
+      if (sg && sg[monthIdx]) {
+        spatialGrid = sg[monthIdx];
+        gridNRows = spatialGrid.length;
+        gridNCols = spatialGrid[0]?.length ?? 0;
+      }
     }
 
-    const val = means[monthIdx];
-    if (val === null || val === undefined) return;
+    // ── Color ramp setup — stretch across ALL months so colours are comparable –
+    const [loHex, hiHex] = TC_MAP_RAMPS[varKey];
+    const [loR, loG, loB] = hexToRgb(loHex);
+    const [hiR, hiG, hiB] = hexToRgb(hiHex);
 
-    // ── Stretch: min/max across all 12 months ────────────────────────────
-    const allVals = means.filter((v): v is number => v !== null);
+    // Compute global min/max across all 12 months (spatial or scalar)
+    let allVals: number[];
+    if (spatialGrid && tc.variables[varKey === 'bf' ? 'ppt' : varKey].spatial_grid) {
+      // Collect from all 12 months of spatial grids
+      allVals = [];
+      for (let m = 0; m < 12; m++) {
+        let monthGrid: (number | null)[][] | null = null;
+        if (varKey === 'bf') {
+          const pG = tc.variables.ppt.spatial_grid!;
+          const aG = tc.variables.aet.spatial_grid!;
+          const qG = tc.variables.q.spatial_grid!;
+          if (pG[m] && aG[m] && qG[m]) {
+            monthGrid = pG[m].map((row, r) =>
+              row.map((p, c) => {
+                const a = aG[m][r]?.[c] ?? null;
+                const q = qG[m][r]?.[c] ?? null;
+                if (p === null || a === null || q === null) return null;
+                return Math.max(0, p - a - q);
+              })
+            );
+          }
+        } else {
+          monthGrid = tc.variables[varKey].spatial_grid?.[m] ?? null;
+        }
+        if (monthGrid) {
+          for (const row of monthGrid) {
+            for (const v of row) {
+              if (v !== null) allVals.push(v);
+            }
+          }
+        }
+      }
+    } else {
+      // Scalar fallback: use monthly_means
+      const means = varKey === 'bf' ? baseflowMeansRef.current : tc.variables[varKey].monthly_means;
+      allVals = means.filter((v): v is number => v !== null);
+    }
+
     if (allVals.length === 0) return;
     const mn = Math.min(...allVals);
     const mx = Math.max(...allVals);
     const range = mx - mn;
-
-    // ── Color interpolation ──────────────────────────────────────────────
-    const [loHex, hiHex] = TC_MAP_RAMPS[varKey];
-    const [loR, loG, loB] = hexToRgb(loHex);
-    const [hiR, hiG, hiB] = hexToRgb(hiHex);
 
     const colorForValue = (v: number): [number, number, number] => {
       const t = range < 0.001 ? 0.5 : Math.max(0, Math.min(1, (v - mn) / range));
@@ -458,43 +565,81 @@ export default function GraceExplorer() {
       ];
     };
 
-    // ── TC grid specs: 1/24° ≈ 0.04167° per pixel ────────────────────────
-    // For a bbox AOI: the TC backend returns the SPATIAL MEAN across the region,
-    // stored as a single scalar per month in monthly_means.  So the overlay is
-    // a uniform-color rectangle for that month — we still upscale it for smooth edges.
-    // For a point AOI: same single-value per month.
-    const TC_STEP = 1 / 24; // °
+    // ── Paint source canvas: 1 canvas-pixel per TC grid cell ─────────────
+    // SPATIAL PATH: paint each pixel its own color from the spatial grid
+    // SCALAR FALLBACK: uniform color (point query or very small bbox)
+    let srcCanvas: HTMLCanvasElement;
+    let imgSouth: number, imgNorth: number, imgWest: number, imgEast: number;
 
-    // Determine the TC pixel bounds snapped to the AOI
-    const tcColMin = Math.floor(aoi.minLon / TC_STEP);
-    const tcColMax = Math.ceil(aoi.maxLon  / TC_STEP);
-    const tcRowMin = Math.floor(aoi.minLat / TC_STEP);
-    const tcRowMax = Math.ceil(aoi.maxLat  / TC_STEP);
+    if (spatialGrid && gridNRows > 0 && gridNCols > 0) {
+      // Spatial path — 1px per TC native cell (~4 km)
+      srcCanvas = document.createElement('canvas');
+      srcCanvas.width  = gridNCols;
+      srcCanvas.height = gridNRows;
+      const srcCtx = srcCanvas.getContext('2d')!;
+      const srcData = srcCtx.createImageData(gridNCols, gridNRows);
 
-    const tcCols = Math.max(1, tcColMax - tcColMin);
-    const tcRows = Math.max(1, tcRowMax - tcRowMin);
+      // TC grid row 0 = northernmost; canvas row 0 = top → matches directly
+      for (let row = 0; row < gridNRows; row++) {
+        for (let col = 0; col < gridNCols; col++) {
+          const v = spatialGrid[row][col];
+          const idx = (row * gridNCols + col) * 4;
+          if (v === null) {
+            srcData.data[idx + 3] = 0; // transparent for nodata
+          } else {
+            const [r, g, b] = colorForValue(v);
+            srcData.data[idx]     = r;
+            srcData.data[idx + 1] = g;
+            srcData.data[idx + 2] = b;
+            srcData.data[idx + 3] = 220;
+          }
+        }
+      }
+      srcCtx.putImageData(srcData, 0, 0);
 
-    // ── Paint small source canvas (1px per TC cell) ──────────────────────
-    // Since TC monthly_means returns a single scalar (spatial mean), all cells
-    // have the same value — but we still build the grid for future extensibility
-    // and so the bilinear upscale edge-smoothing works properly.
-    const [r, g, b] = colorForValue(val);
+      // Geographic bounds: TC cell size = 1/24°
+      // The Python script uses lat_to_idx / lon_to_idx which snap to nearest cell centre.
+      // We reconstruct the exact bounds from the grid dimensions and AOI corners.
+      const TC_STEP = 1 / 24;
+      const latTopIdx = Math.round((89.97916667 - aoi.maxLat) / TC_STEP);
+      const lonLeftIdx = Math.round((aoi.minLon - (-179.97916667)) / TC_STEP);
+      // Clamp indices based on actual data returned (may be smaller than AOI due to 200-cell cap)
+      imgNorth = 89.97916667 - latTopIdx * TC_STEP + TC_STEP / 2;
+      imgSouth = imgNorth - gridNRows * TC_STEP;
+      imgWest  = -179.97916667 + lonLeftIdx * TC_STEP - TC_STEP / 2;
+      imgEast  = imgWest + gridNCols * TC_STEP;
+    } else {
+      // Scalar fallback path — single uniform color for the whole AOI
+      const means = varKey === 'bf' ? baseflowMeansRef.current : tc.variables[varKey].monthly_means;
+      const val = means[monthIdx];
+      if (val === null || val === undefined) return;
 
-    const srcCanvas = document.createElement('canvas');
-    srcCanvas.width  = Math.max(1, tcCols);
-    srcCanvas.height = Math.max(1, tcRows);
-    const srcCtx = srcCanvas.getContext('2d')!;
-    const srcData = srcCtx.createImageData(srcCanvas.width, srcCanvas.height);
-    for (let i = 0; i < srcData.data.length; i += 4) {
-      srcData.data[i]   = r;
-      srcData.data[i+1] = g;
-      srcData.data[i+2] = b;
-      srcData.data[i+3] = 220; // slight transparency
+      const TC_STEP = 1 / 24;
+      const tcCols = Math.max(1, Math.ceil((aoi.maxLon - aoi.minLon) / TC_STEP));
+      const tcRows = Math.max(1, Math.ceil((aoi.maxLat - aoi.minLat) / TC_STEP));
+
+      srcCanvas = document.createElement('canvas');
+      srcCanvas.width  = tcCols;
+      srcCanvas.height = tcRows;
+      const srcCtx = srcCanvas.getContext('2d')!;
+      const [r, g, b] = colorForValue(val);
+      const srcData = srcCtx.createImageData(tcCols, tcRows);
+      for (let i = 0; i < srcData.data.length; i += 4) {
+        srcData.data[i]   = r;
+        srcData.data[i+1] = g;
+        srcData.data[i+2] = b;
+        srcData.data[i+3] = 220;
+      }
+      srcCtx.putImageData(srcData, 0, 0);
+      imgSouth = aoi.minLat; imgNorth = aoi.maxLat;
+      imgWest  = aoi.minLon; imgEast  = aoi.maxLon;
     }
-    srcCtx.putImageData(srcData, 0, 0);
 
-    // ── Upscale to a larger canvas with bilinear smoothing ───────────────
-    // Target: ~6x upscale so the 4km pixels look smooth at map zoom levels
+    // ── Upscale with bilinear smoothing for display — ~6 × original size ─
+    // Using imageSmoothingEnabled=true creates a gentle bilinear interpolation
+    // that softens the hard pixel edges while preserving structural patterns.
+    // (Per the spec: "resample bilinear so 4km pixel boundaries are visible but
+    // not distorted".)
     const SCALE = 6;
     const dstCanvas = document.createElement('canvas');
     dstCanvas.width  = srcCanvas.width  * SCALE;
@@ -506,17 +651,11 @@ export default function GraceExplorer() {
 
     const dataUrl = dstCanvas.toDataURL('image/png');
 
-    // ── Geographic bounds for the overlay (AOI bbox) ─────────────────────
-    const imgSouth = aoi.minLat;
-    const imgNorth = aoi.maxLat;
-    const imgWest  = aoi.minLon;
-    const imgEast  = aoi.maxLon;
-
     // ── Place Leaflet ImageOverlay ────────────────────────────────────────
     if (tcImageOverlayRef.current) tcImageOverlayRef.current.remove();
     const overlay = L.imageOverlay(dataUrl, [[imgSouth, imgWest], [imgNorth, imgEast]], {
       opacity: tcRasterOpacityRef.current,
-      zIndex: 196, // above GRACE (195) — TC sits on top when both layers are on
+      zIndex: 196,
       interactive: false,
       className: 'tc-raster-overlay',
     });
@@ -1488,41 +1627,35 @@ export default function GraceExplorer() {
   // Keep ref in sync so animation interval can read the latest baseflow values
   baseflowMeansRef.current = baseflowMeans;
 
-  function TCBarChart({ varKey }: { varKey: "ppt" | "aet" | "q" | "bf" }) {
-    const data = varKey === "bf"
-      ? baseflowMeans.map((v, i) => ({ label: MONTH_LABELS[i], value: v }))
-      : tcChartData(varKey as "ppt" | "aet" | "q");
-    const color = TC_COLORS[varKey];
-    return (
-      <div style={{ height: 110, padding: "0 2px 0 0" }}>
-        <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={data} margin={{ top: 2, right: 6, left: -14, bottom: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#21262d" vertical={false}/>
-            <XAxis
-              dataKey="label"
-              tick={{ fill: "#6e7681", fontSize: 9, fontFamily: "monospace" }}
-              tickLine={false}
-              axisLine={{ stroke: "#30363d" }}
-              interval={tcChartMode === "annual" ? 3 : tcChartMode === "monthly_series" ? 23 : 0}
-            />
-            <YAxis
-              tick={{ fill: "#6e7681", fontSize: 9, fontFamily: "monospace" }}
-              tickLine={false}
-              axisLine={false}
-              tickFormatter={(v: number) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v.toFixed(0)}
-              width={32}
-            />
-            <Tooltip
-              contentStyle={{ background: "#161b22", border: "1px solid #30363d", borderRadius: 6, fontSize: 10, fontFamily: "monospace", color: "#e6edf3" }}
-              cursor={{ fill: "#21262d" }}
-              formatter={(val: number) => [`${val?.toFixed(1)} mm`, TC_LABELS[varKey]]}
-            />
-            <Bar dataKey="value" maxBarSize={tcChartMode === "annual" ? 16 : tcChartMode === "monthly_series" ? 6 : 18} radius={[2, 2, 0, 0]} fill={color} fillOpacity={0.85}/>
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-    );
-  }
+  // Pre-compute stable chart data objects — only recompute when tcResult or tcChartMode changes
+  // (NOT when tcMapMonth or tcMapVar changes, preventing chart flashing during animation)
+  const stableTCChartData = useMemo(() => {
+    const result: Record<string, { label: string; value: number | null }[]> = {};
+    for (const varKey of ["ppt", "aet", "q"] as const) {
+      result[varKey] = tcChartData(varKey);
+    }
+    result["bf"] = baseflowMeans.map((v, i) => ({ label: MONTH_LABELS[i], value: v }));
+    return result;
+  }, [tcResult, tcChartMode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Stable interval hint for XAxis — also only from tcChartMode
+  const chartInterval = tcChartMode === "annual" ? 3 : tcChartMode === "monthly_series" ? 23 : 0;
+  const chartMaxBarSize = tcChartMode === "annual" ? 16 : tcChartMode === "monthly_series" ? 6 : 18;
+
+  // TCBarChart is a memo component defined OUTSIDE GraceExplorer (see below);
+  // we bind chart data here so the component receives stable props.
+  const TCBarChart = useCallback(
+    ({ varKey }: { varKey: "ppt" | "aet" | "q" | "bf" }) => (
+      <TCBarChartStatic
+        data={stableTCChartData[varKey] ?? []}
+        color={TC_COLORS[varKey]}
+        label={TC_LABELS[varKey]}
+        interval={chartInterval}
+        maxBarSize={chartMaxBarSize}
+      />
+    ),
+    [stableTCChartData, chartInterval, chartMaxBarSize]
+  );
 
   return (
     <>
@@ -2416,9 +2549,13 @@ export default function GraceExplorer() {
           )}
 
 
-          {/* ── FLOATING HYDROLOGY PANEL (bottom-left of map) ── */}
+          {/* ── FLOATING HYDROLOGY PANEL (right side of map, vertically centred) ── */}
+          {/* Positioned on the RIGHT at mid-height — clear of both the top GRACE bar
+               and the bottom TC seasonal-flux bar. */}
           <div style={{
-            position: "absolute", bottom: 28, left: 10, zIndex: 500,
+            position: "absolute", top: "50%", right: 10,
+            transform: "translateY(-50%)",
+            zIndex: 500,
             background: "rgba(22,27,34,0.93)", border: "1px solid #30363d",
             borderRadius: 8, padding: "8px 10px", minWidth: 148,
             boxShadow: "0 2px 12px rgba(0,0,0,0.5)",
