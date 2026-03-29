@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { apiRequest } from "@/lib/queryClient";
+import { apiRequest, isRetryableError } from "@/lib/queryClient";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis,
   CartesianGrid, Tooltip, ReferenceLine, Cell,
@@ -90,6 +90,7 @@ export default function GraceExplorer() {
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
   const [queryLoading, setQueryLoading] = useState(false);
   const [queryError, setQueryError] = useState<string | null>(null);
+  const [queryRetryMsg, setQueryRetryMsg] = useState<string | null>(null);
   const [locationName, setLocationName] = useState<string>("");
   const [searchText, setSearchText] = useState("");
   const [searchLoading, setSearchLoading] = useState(false);
@@ -99,6 +100,7 @@ export default function GraceExplorer() {
   const [tcResult, setTcResult] = useState<TCResult | null>(null);
   const [tcLoading, setTcLoading] = useState(false);
   const [tcError, setTcError] = useState<string | null>(null);
+  const [tcRetryMsg, setTcRetryMsg] = useState<string | null>(null);
   const [tcChartMode, setTcChartMode] = useState<"annual" | "monthly_series" | "monthly_mean">("annual");
 
   // TC map overlay state
@@ -119,6 +121,7 @@ export default function GraceExplorer() {
   const [geoSummary, setGeoSummary] = useState<string | null>(null);
   const [geoLoading, setGeoLoading] = useState(false);
   const [geoError, setGeoError] = useState<string | null>(null);
+  const [geoRetryMsg, setGeoRetryMsg] = useState<string | null>(null);
 
   // GRACE raster overlay
   const [graceRasterYear, setGraceRasterYear] = useState(2024);
@@ -601,6 +604,41 @@ export default function GraceExplorer() {
   useEffect(() => () => { if (playIntervalRef.current) clearInterval(playIntervalRef.current); }, []);
 
   // Convert raw fetch/HTTP errors into user-friendly messages
+  // ---------------------------------------------------------------------------
+  // Fix 1 — warm-up ping: fires once on mount while user reads splash screen.
+  // Sends a /api/status request immediately so Render has ~30 s to wake up.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    fetch('/api/status').catch(() => {}); // fire-and-forget, silent
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Retry helper — wraps an async thunk with up to MAX_RETRIES attempts.
+  // Waits RETRY_DELAY_MS between retries; shows progress via setMsg callback.
+  // Used by runQuery, runTCQuery, runGeoQuery to survive Render cold starts.
+  // ---------------------------------------------------------------------------
+  const MAX_RETRIES = 6;
+  const RETRY_DELAY_MS = 5_000;
+
+  async function withRetry<T>(
+    thunk: () => Promise<T>,
+    setMsg: (msg: string | null) => void,
+  ): Promise<T> {
+    let attempt = 0;
+    while (true) {
+      try {
+        const result = await thunk();
+        setMsg(null);
+        return result;
+      } catch (e: any) {
+        attempt++;
+        if (!isRetryableError(e) || attempt >= MAX_RETRIES) throw e;
+        setMsg(`Server waking up — retrying (${attempt}/${MAX_RETRIES})…`);
+        await new Promise((res) => setTimeout(res, RETRY_DELAY_MS));
+      }
+    }
+  }
+
   function friendlyError(e: any): string {
     const msg: string = String(e?.message ?? e ?? "");
     // apiRequest throws "502: <!DOCTYPE..." or "503: ..." before returning
@@ -620,12 +658,17 @@ export default function GraceExplorer() {
   const runQuery = useCallback(async (q: { type: "point" | "bbox"; params: Record<string, number> }) => {
     setQueryLoading(true);
     setQueryError(null);
+    setQueryRetryMsg(null);
     try {
-      const ps = new URLSearchParams(Object.entries(q.params).map(([k, v]) => [k, String(v)]));
-      const url = q.type === "point" ? `/api/query/point?${ps}` : `/api/query/bbox?${ps}`;
-      const res = await apiRequest("GET", url);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const data = await withRetry(async () => {
+        const ps = new URLSearchParams(Object.entries(q.params).map(([k, v]) => [k, String(v)]));
+        const url = q.type === "point" ? `/api/query/point?${ps}` : `/api/query/bbox?${ps}`;
+        const res = await apiRequest("GET", url);
+        const d = await res.json();
+        if (d.error) throw new Error(d.error);
+        return d;
+      }, setQueryRetryMsg);
+
       setQueryResult(data);
       // Pass original coords so TC AOI box lands on the actual click, not the GRACE-snapped cell
       const orig = q.type === "point" ? { lat: q.params.lat, lon: q.params.lon } : undefined;
@@ -635,8 +678,8 @@ export default function GraceExplorer() {
       // These are the SAME values the stats box shows as Min/Max.
       // lo → full blue endpoint, hi → full red endpoint, 0 always = white.
       const annualVals = (data.annual as SeriesPoint[])
-        .map((d) => d.lwe)
-        .filter((v): v is number => v !== null && v !== undefined);
+        .map((d: SeriesPoint) => d.lwe)
+        .filter((v: number | null | undefined): v is number => v !== null && v !== undefined);
       if (annualVals.length > 0) {
         const seriesMin = Math.min(...annualVals);
         const seriesMax = Math.max(...annualVals);
@@ -669,6 +712,7 @@ export default function GraceExplorer() {
       setQueryError(friendlyError(e));
     } finally {
       setQueryLoading(false);
+      setQueryRetryMsg(null);
     }
   }, [drawTiles, graceRasterYear]);
 
@@ -676,17 +720,22 @@ export default function GraceExplorer() {
     setTcLoading(true);
     setTcError(null);
     setTcResult(null);
+    setTcRetryMsg(null);
     try {
-      const ps = new URLSearchParams(Object.entries(q.params).map(([k, v]) => [k, String(v)]));
-      const url = q.type === "point" ? `/api/terraclimate/point?${ps}` : `/api/terraclimate/bbox?${ps}`;
-      const res = await apiRequest("GET", url);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const data = await withRetry(async () => {
+        const ps = new URLSearchParams(Object.entries(q.params).map(([k, v]) => [k, String(v)]));
+        const url = q.type === "point" ? `/api/terraclimate/point?${ps}` : `/api/terraclimate/bbox?${ps}`;
+        const res = await apiRequest("GET", url);
+        const d = await res.json();
+        if (d.error) throw new Error(d.error);
+        return d;
+      }, setTcRetryMsg);
       setTcResult(data);
     } catch (e: any) {
       setTcError(friendlyError(e));
     } finally {
       setTcLoading(false);
+      setTcRetryMsg(null);
     }
   }, []);
 
@@ -694,30 +743,35 @@ export default function GraceExplorer() {
     setGeoLoading(true);
     setGeoError(null);
     setGeoSummary(null);
+    setGeoRetryMsg(null);
     try {
-      const p = q.params;
-      const ps = new URLSearchParams();
-      if (q.type === "point") {
-        ps.set("lat", String(p.lat));
-        ps.set("lon", String(p.lon));
-      } else {
-        // Use center of bbox for lat/lon, plus bbox params
-        ps.set("lat", String((p.minLat + p.maxLat) / 2));
-        ps.set("lon", String((p.minLon + p.maxLon) / 2));
-        ps.set("minLat", String(p.minLat));
-        ps.set("maxLat", String(p.maxLat));
-        ps.set("minLon", String(p.minLon));
-        ps.set("maxLon", String(p.maxLon));
-      }
-      ps.set("name", locationName);
-      const res = await apiRequest("GET", `/api/geology?${ps}`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const data = await withRetry(async () => {
+        const p = q.params;
+        const ps = new URLSearchParams();
+        if (q.type === "point") {
+          ps.set("lat", String(p.lat));
+          ps.set("lon", String(p.lon));
+        } else {
+          // Use center of bbox for lat/lon, plus bbox params
+          ps.set("lat", String((p.minLat + p.maxLat) / 2));
+          ps.set("lon", String((p.minLon + p.maxLon) / 2));
+          ps.set("minLat", String(p.minLat));
+          ps.set("maxLat", String(p.maxLat));
+          ps.set("minLon", String(p.minLon));
+          ps.set("maxLon", String(p.maxLon));
+        }
+        ps.set("name", locationName);
+        const res = await apiRequest("GET", `/api/geology?${ps}`);
+        const d = await res.json();
+        if (d.error) throw new Error(d.error);
+        return d;
+      }, setGeoRetryMsg);
       setGeoSummary(data.summary);
     } catch (e: any) {
       setGeoError(friendlyError(e));
     } finally {
       setGeoLoading(false);
+      setGeoRetryMsg(null);
     }
   }, [locationName]);
 
@@ -1909,8 +1963,11 @@ export default function GraceExplorer() {
             <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 20 }}>
               <div style={{ width: 24, height: 24, borderRadius: "50%", border: "2px solid #30363d", borderTopColor: "#60a5fa", animation: "spin 0.8s linear infinite", marginBottom: 10 }}/>
               <div style={{ fontSize: "11px", color: "#8b949e", textAlign: "center", lineHeight: 1.6 }}>
-                Fetching TerraClimate data<br/>
-                <span style={{ fontSize: "10px", color: "#484f58" }}>Querying THREDDS server…</span>
+                {tcRetryMsg ? (
+                  <><span style={{ color: "#f59e0b" }}>{tcRetryMsg}</span><br/><span style={{ fontSize: "10px", color: "#484f58" }}>Server is warming up — please wait…</span></>
+                ) : (
+                  <>Fetching TerraClimate data<br/><span style={{ fontSize: "10px", color: "#484f58" }}>Querying THREDDS server…</span></>
+                )}
               </div>
             </div>
           )}
@@ -2426,7 +2483,9 @@ export default function GraceExplorer() {
             <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
               <div style={{ textAlign: "center" }}>
                 <div style={{ width: 28, height: 28, borderRadius: "50%", border: "2px solid #30363d", borderTopColor: "#22d3ee", animation: "spin 0.8s linear infinite", margin: "0 auto 8px" }}/>
-                <div style={{ fontSize: "12px", color: "#8b949e" }}>Querying…</div>
+                <div style={{ fontSize: "12px", color: "#8b949e" }}>
+                  {queryRetryMsg ? <span style={{ color: "#f59e0b" }}>{queryRetryMsg}</span> : "Querying…"}
+                </div>
               </div>
             </div>
           )}
@@ -2606,7 +2665,7 @@ export default function GraceExplorer() {
                     {geoLoading && (
                       <span style={{ color: "#8b949e", fontSize: "11px" }}>
                         <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", border: "1.5px solid #30363d", borderTopColor: "#a3a3a3", animation: "spin 0.8s linear infinite", marginRight: 8, verticalAlign: "middle" }}/>
-                        Generating geology summary…
+                        {geoRetryMsg ? <span style={{ color: "#f59e0b" }}>{geoRetryMsg}</span> : "Generating geology summary…"}
                       </span>
                     )}
                     {geoError && !geoLoading && <span style={{ color: "#f87171", fontSize: "11px" }}>{geoError}</span>}

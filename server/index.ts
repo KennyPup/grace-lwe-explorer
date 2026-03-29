@@ -98,6 +98,26 @@ app.use((req, res, next) => {
     },
     () => {
       log(`serving on port ${port}`);
+
+      // -----------------------------------------------------------------------
+      // Fix 3 — Keep-alive self-ping (Render free tier inactivity prevention)
+      // Render suspends services after 15 min of inactivity. Pinging ourselves
+      // every 14 min resets that timer so the service stays warm during a session.
+      // -----------------------------------------------------------------------
+      setInterval(async () => {
+        try {
+          // Use http.get() to avoid importing node-fetch; works in all Node versions
+          const http = await import("http");
+          http.get(`http://localhost:${port}/api/status`, (res) => {
+            log(`[KeepAlive] self-ping → ${res.statusCode}`);
+            res.resume(); // consume & discard body
+          }).on("error", (err) => {
+            log(`[KeepAlive] self-ping error: ${err.message}`);
+          });
+        } catch (e: any) {
+          log(`[KeepAlive] self-ping exception: ${e.message}`);
+        }
+      }, 14 * 60 * 1000); // 14 minutes
     },
   );
 })();
